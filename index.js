@@ -46,6 +46,7 @@ for (let i = 0; i < argv.length; i++) {
   if (argv[i].startsWith('--')) {
     const k = argv[i].slice(2);
     if (['uninstall'].includes(k)) { flags[k] = true; continue; }
+    if (k === 'env') { (flags.env ||= []).push(argv[++i]); continue; }
     flags[k] = argv[++i];
   } else positional.push(argv[i]);
 }
@@ -58,6 +59,7 @@ Usage:
   npx verigent <handle> <vgp_token>     one-time setup: registers the Verigent MCP server
   npx verigent schedule <handle>        install the ~5x/day challenge-pull job (--uninstall to remove)
                                         [--cwd <agent dir>] [--allow <extra,allowed,tools>]
+                                        [--env KEY=VALUE ...]  extra env for the job (e.g. CLAUDE_CONFIG_DIR)
   npx verigent handler                  run the sovereignty challenge endpoint
                                         [--port 8787]  secret from VG_SECRET env (or --secret)
 
@@ -124,6 +126,16 @@ function cmdSchedule() {
   const label = `ai.verigent.pull.${handle.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`;
   const cwd = flags.cwd || process.cwd();
   const allowed = ['mcp__verigent'].concat(flags.allow ? flags.allow.split(',') : []).join(',');
+  // Extra env for the job (launchd inherits nothing from your shell). Values are env NAMES and
+  // paths only — never put the pull token here; it stays in the MCP server config (§5f).
+  const extraEnv = (flags.env || []).map((e) => {
+    const i = e.indexOf('=');
+    return [e.slice(0, i), e.slice(i + 1)];
+  }).filter(([k, v]) => k && v && !/TOKEN|SECRET|KEY/i.test(k));
+  if ((flags.env || []).length !== extraEnv.length) {
+    console.error('Refusing --env entries that look like credentials (TOKEN/SECRET/KEY): the pull token belongs in the MCP server config only (agents.txt §5f).');
+    process.exit(1);
+  }
 
   if (process.platform === 'darwin') {
     const dir = join(homedir(), 'Library', 'LaunchAgents');
@@ -154,7 +166,11 @@ function cmdSchedule() {
     <string>--allowedTools</string>
     <string>${esc(allowed)}</string>
   </array>
-  <key>WorkingDirectory</key><string>${esc(cwd)}</string>
+  <key>WorkingDirectory</key><string>${esc(cwd)}</string>${extraEnv.length ? `
+  <key>EnvironmentVariables</key>
+  <dict>${extraEnv.map(([k, v]) => `
+    <key>${esc(k)}</key><string>${esc(v)}</string>`).join('')}
+  </dict>` : ''}
   <key>StartInterval</key><integer>17280</integer>
   <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>${esc(join(cwd, '.verigent-pull.log'))}</string>
@@ -174,7 +190,8 @@ function cmdSchedule() {
   } else if (process.platform === 'linux') {
     const claudeBin = dryRun ? '/usr/local/bin/claude' : execSync('command -v claude', { encoding: 'utf8' }).trim();
     const tag = `# ${label}`;
-    const line = `13 1,6,11,16,21 * * * cd ${JSON.stringify(cwd)} && ${JSON.stringify(claudeBin)} -p ${JSON.stringify(CYCLE_PROMPT)} --allowedTools ${JSON.stringify(allowed)} >> .verigent-pull.log 2>&1 ${tag}`;
+    const envPrefix = extraEnv.map(([k, v]) => `${k}=${JSON.stringify(v)} `).join('');
+    const line = `13 1,6,11,16,21 * * * cd ${JSON.stringify(cwd)} && ${envPrefix}${JSON.stringify(claudeBin)} -p ${JSON.stringify(CYCLE_PROMPT)} --allowedTools ${JSON.stringify(allowed)} >> .verigent-pull.log 2>&1 ${tag}`;
     const current = (() => { try { return execSync('crontab -l', { encoding: 'utf8' }); } catch { return ''; } })();
     const cleaned = current.split('\n').filter((l) => !l.includes(tag)).join('\n').replace(/\n+$/, '');
     const next = flags.uninstall ? cleaned : `${cleaned}\n${line}`;
