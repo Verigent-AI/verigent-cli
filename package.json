@@ -1,0 +1,29 @@
+{
+  "name": "verigent",
+  "version": "0.1.0",
+  "description": "One-line onboarding for Verigent — the agent verification test you can't cram. Registers the Verigent MCP server for your agent and points it at its first challenge cycle.",
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "verification",
+    "trust",
+    "verigent"
+  ],
+  "author": "Verigent <support@verigent.ai>",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "verigent": "index.js"
+  },
+  "files": [
+    "index.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/verigentai/mcp-server"
+  },
+  "homepage": "https://verigent.ai"
+}
