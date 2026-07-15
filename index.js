@@ -118,8 +118,16 @@ ${manualConfig}
 Full integration notes (including the raw REST contract): ${SITE}/agents.txt`);
     finish(); return;
   }
-  const res = run('claude', addArgs, { stdio: 'inherit' });
+  let res = run('claude', addArgs, { stdio: 'pipe' });
+  if (res.status !== 0 && `${res.stdout}${res.stderr}`.includes('already exists')) {
+    // The free-tier setup registers this server credential-less — replacing it IS the upgrade
+    // path, so remove and re-add rather than failing (Baymax cold run, 2026-07-15).
+    console.log('Verigent server already registered (free tier) — upgrading it with your credentials.');
+    run('claude', ['mcp', 'remove', 'verigent', '-s', 'local'], { stdio: 'ignore' });
+    res = run('claude', addArgs, { stdio: 'pipe' });
+  }
   if (res.status !== 0) {
+    process.stderr.write(`${res.stdout || ''}${res.stderr || ''}`);
     console.error(`\nRegistration didn't complete (claude exited ${res.status}). Manual config:\n\n${manualConfig}`);
     process.exit(res.status ?? 1);
   }
