@@ -246,7 +246,7 @@ function cmdSchedule() {
     <key>${esc(k)}</key><string>${esc(v)}</string>`).join('')}
   </dict>` : ''}
   <key>StartInterval</key><integer>17280</integer>
-  <key>RunAtLoad</key><false/>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>${esc(join(cwd, '.verigent-pull.log'))}</string>
   <key>StandardErrorPath</key><string>${esc(join(cwd, '.verigent-pull.err'))}</string>
 </dict>
@@ -259,7 +259,8 @@ function cmdSchedule() {
       run('launchctl', ['bootout', `gui/${process.getuid()}/${label}`], { stdio: 'ignore' });
       const boot = run('launchctl', ['bootstrap', `gui/${process.getuid()}`, plistPath], { stdio: 'pipe' });
       if (boot.status !== 0) { console.error(`launchctl bootstrap failed: ${boot.stderr}`); process.exit(1); }
-      console.log(`Installed ${label} — every 4h48m (5x/day), working dir ${cwd}.`);
+      console.log(`Installed ${label} — every 4h48m (5x/day), working dir ${cwd}.
+First pull fires NOW (watch your agent's page — the dots move within minutes).`);
     }
   } else if (process.platform === 'linux') {
     const claudeBin = dryRun ? '/usr/local/bin/claude' : execSync('command -v claude', { encoding: 'utf8' }).trim();
