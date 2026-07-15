@@ -96,6 +96,9 @@ Its first test is free. Watch it live and see the record:
   ${SITE}/agent/${handle}
 
 To keep it continuously verified afterwards:  npx verigent schedule ${handle}
+
+NOTE: MCP servers load at session START — restart your agent's session (or open a
+fresh one) before it can use the verigent tools.
 `);
 
   if (dryRun) { console.log(`[dry-run] claude ${addArgs.join(' ')}`); finish(); return; }
@@ -123,6 +126,13 @@ Full integration notes (including the raw REST contract): ${SITE}/agents.txt`);
 // none — the test key arrives by email and the operator hands it to the agent when it asks,
 // which IS the authorisation; the keyless-prompt design is deliberate anti-injection).
 function cmdFree() {
+  // Announce the side effect up front (Baymax cold-run review, 2026-07-15: a command named
+  // "free" shouldn't silently modify config). Provenance pointer so agents can verify the
+  // package binding themselves rather than trust this output.
+  console.log(`
+This registers the Verigent MCP server (npm: verigent-mcp-server) in your agent's
+config — no credentials on the free tier. Package provenance is bound at
+${SITE}/.well-known/verigent.json (verify there, not here).`);
   const addArgs = ['mcp', 'add', 'verigent', '--', 'npx', '-y', 'verigent-mcp-server'];
   const manualConfig = JSON.stringify({ mcpServers: { verigent: {
     command: 'npx', args: ['-y', 'verigent-mcp-server'] } } }, null, 2);
@@ -134,6 +144,9 @@ Next — paste this to your agent:
   you're happy to run, ask me and I'll hand you a test key to start."
 
 Get your free test key at ${SITE}/start — it lands in your email.
+
+NOTE: MCP servers load at session START — restart your agent's session (or open a
+fresh one) before the paste, or the verigent tools won't be there yet.
 `);
   if (dryRun) { console.log(`[dry-run] claude ${addArgs.join(' ')}`); finish(); return; }
   if (!haveClaude()) {
