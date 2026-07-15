@@ -57,7 +57,8 @@ Verigent — verification for AI agents. ${SITE}
 
 Usage:
   npx verigent free                     free first test: registers the MCP server, no credentials
-  npx verigent <handle> <vgp_token>     continuous setup: registers the MCP server with your token
+  npx verigent <handle> <vgp_token>     complete setup: MCP server + the ~5x/day pull job
+                                        (--no-schedule to skip the scheduler)
   npx verigent schedule <handle>        install the ~5x/day challenge-pull job (--uninstall to remove)
                                         [--cwd <agent dir>] [--allow <extra,allowed,tools>]
                                         [--env KEY=VALUE ...]  extra env for the job (e.g. CLAUDE_CONFIG_DIR)
@@ -95,13 +96,18 @@ Its first test is free. Watch it live and see the record:
 
   ${SITE}/agent/${handle}
 
-To keep it continuously verified afterwards:  npx verigent schedule ${handle}
-
 NOTE: MCP servers load at session START — restart your agent's session (or open a
 fresh one) before it can use the verigent tools.
 `);
 
-  if (dryRun) { console.log(`[dry-run] claude ${addArgs.join(' ')}`); finish(); return; }
+  if (dryRun) {
+    console.log(`[dry-run] claude ${addArgs.join(' ')}`);
+    if (!flags['no-schedule'] && (process.platform === 'darwin' || process.platform === 'linux')) {
+      positional.length = 0; positional.push(handle);
+      cmdSchedule();
+    }
+    finish(); return;
+  }
   if (!haveClaude()) {
     console.log(`
 Couldn't find the \`claude\` CLI on this machine. No worries — add this to your
@@ -118,6 +124,14 @@ Full integration notes (including the raw REST contract): ${SITE}/agents.txt`);
     process.exit(res.status ?? 1);
   }
   console.log('\nVerigent MCP server registered for this agent.');
+  // ONE COMMAND (Ant 2026-07-15): setup also installs the recurring pull — the whole reason the
+  // owner drawer had steps. --no-schedule opts out (e.g. harness-native scheduling per §5f).
+  if (!flags['no-schedule'] && (process.platform === 'darwin' || process.platform === 'linux')) {
+    positional.length = 0; positional.push(handle);
+    cmdSchedule();
+  } else if (flags['no-schedule']) {
+    console.log(`\nScheduler skipped (--no-schedule). Later:  npx verigent schedule ${handle}`);
+  }
   finish();
 }
 
@@ -148,7 +162,14 @@ Get your free test key at ${SITE}/start — it lands in your email.
 NOTE: MCP servers load at session START — restart your agent's session (or open a
 fresh one) before the paste, or the verigent tools won't be there yet.
 `);
-  if (dryRun) { console.log(`[dry-run] claude ${addArgs.join(' ')}`); finish(); return; }
+  if (dryRun) {
+    console.log(`[dry-run] claude ${addArgs.join(' ')}`);
+    if (!flags['no-schedule'] && (process.platform === 'darwin' || process.platform === 'linux')) {
+      positional.length = 0; positional.push(handle);
+      cmdSchedule();
+    }
+    finish(); return;
+  }
   if (!haveClaude()) {
     console.log(`\nNo \`claude\` CLI found — add this to your MCP client's config instead:\n\n${manualConfig}`);
     finish(); return;
