@@ -224,6 +224,13 @@ function cmdSchedule() {
     }
     const claudeBin = dryRun ? '/usr/local/bin/claude'
       : (execSync(isWin ? 'where claude' : 'command -v claude', { encoding: 'utf8' }).trim().split('\n')[0]);
+    // launchd jobs get a bare PATH that can't find npx — the MCP server then silently fails
+    // to connect and the agent wakes up toolless. Bake a real PATH in, always.
+    const npxDir = dryRun ? '/usr/local/bin'
+      : (execSync('command -v npx', { encoding: 'utf8' }).trim().replace(/\/npx$/, '') || '/usr/local/bin');
+    const claudeDir = claudeBin.replace(/\/[^/]+$/, '');
+    const pathEnv = [...new Set([claudeDir, npxDir, '/usr/local/bin', '/usr/bin', '/bin'])].join(':');
+    if (!extraEnv.some(([k]) => k === 'PATH')) extraEnv.push(['PATH', pathEnv]);
     const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
