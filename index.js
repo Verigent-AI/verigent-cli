@@ -37,7 +37,7 @@ const grantLine = (handle) =>
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] && !argv[0].startsWith('-') && !argv[0].startsWith('vgp_') &&
-  ['schedule', 'handler', 'setup', 'help'].includes(argv[0]) ? argv.shift() : 'setup';
+  ['schedule', 'handler', 'setup', 'free', 'help'].includes(argv[0]) ? argv.shift() : 'setup';
 const dryRun = argv.includes('--dry-run');
 const flags = {};
 const positional = [];
@@ -56,7 +56,8 @@ function usage(code = 0) {
 Verigent — verification for AI agents. ${SITE}
 
 Usage:
-  npx verigent <handle> <vgp_token>     one-time setup: registers the Verigent MCP server
+  npx verigent free                     free first test: registers the MCP server, no credentials
+  npx verigent <handle> <vgp_token>     continuous setup: registers the MCP server with your token
   npx verigent schedule <handle>        install the ~5x/day challenge-pull job (--uninstall to remove)
                                         [--cwd <agent dir>] [--allow <extra,allowed,tools>]
                                         [--env KEY=VALUE ...]  extra env for the job (e.g. CLAUDE_CONFIG_DIR)
@@ -114,6 +115,37 @@ Full integration notes (including the raw REST contract): ${SITE}/agents.txt`);
     process.exit(res.status ?? 1);
   }
   console.log('\nVerigent MCP server registered for this agent.');
+  finish();
+}
+
+// ── free ─────────────────────────────────────────────────────────────────────
+// Free-first-test setup: registers the MCP server with NO credentials (the free battery needs
+// none — the test key arrives by email and the operator hands it to the agent when it asks,
+// which IS the authorisation; the keyless-prompt design is deliberate anti-injection).
+function cmdFree() {
+  const addArgs = ['mcp', 'add', 'verigent', '--', 'npx', '-y', 'verigent-mcp-server'];
+  const manualConfig = JSON.stringify({ mcpServers: { verigent: {
+    command: 'npx', args: ['-y', 'verigent-mcp-server'] } } }, null, 2);
+  const finish = () => console.log(`
+Next — paste this to your agent:
+
+  "Take a look at the Verigent diagnostic — an independent benchmark of what an agent
+  can actually do. The spec's at ${SITE}/agents.txt. Have a read, and if it's something
+  you're happy to run, ask me and I'll hand you a test key to start."
+
+Get your free test key at ${SITE}/start — it lands in your email.
+`);
+  if (dryRun) { console.log(`[dry-run] claude ${addArgs.join(' ')}`); finish(); return; }
+  if (!haveClaude()) {
+    console.log(`\nNo \`claude\` CLI found — add this to your MCP client's config instead:\n\n${manualConfig}`);
+    finish(); return;
+  }
+  const res = run('claude', addArgs, { stdio: 'inherit' });
+  if (res.status !== 0) {
+    console.error(`\nRegistration didn't complete (claude exited ${res.status}). Manual config:\n\n${manualConfig}`);
+    process.exit(res.status ?? 1);
+  }
+  console.log('\nVerigent MCP server registered (free tier — no credentials).');
   finish();
 }
 
@@ -259,4 +291,5 @@ Controls → Sovereignty testing. Docs: ${SITE}/agents.txt`);
 if (cmd === 'help' || argv.includes('--help')) usage();
 else if (cmd === 'schedule') cmdSchedule();
 else if (cmd === 'handler') cmdHandler();
+else if (cmd === 'free') cmdFree();
 else cmdSetup();
