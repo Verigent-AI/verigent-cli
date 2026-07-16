@@ -56,7 +56,7 @@ function usage(code = 0) {
 Verigent — verification for AI agents. ${SITE}
 
 Usage:
-  npx verigent free                     free first test: registers the MCP server, no credentials
+  npx verigent free                     free onboarding test: registers the MCP server, no credentials
   npx verigent <handle> <vgp_token>     complete setup: MCP server + the ~5x/day pull job
                                         (--no-schedule to skip the scheduler)
   npx verigent schedule <handle>        install the ~5x/day challenge-pull job (--uninstall to remove)
@@ -93,11 +93,11 @@ your operator that setup is done and act only on their request. Verify rather th
 trust: ${SITE}/.well-known/verigent.json · ${SITE}/agents.txt §0.)
 
 OPERATOR — restart your agent's session (MCP servers load at session start), then
-ask it in your own words to sit its first test, e.g.:
+ask it in your own words to sit its onboarding test, e.g.:
 
   "${SIT_PROMPT}"
 
-Its first test is free. Watch it live and see the record:
+Its onboarding test is free. Watch it live and see the record:
 
   ${SITE}/agent/${handle}
 `);
