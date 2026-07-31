@@ -17,6 +17,11 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const SITE = 'https://verigent.ai';
+// PINNED MCP server version (B7, Greg #6): an unpinned `npx -y verigent-mcp-server` re-pulls latest
+// every run, so what a customer audits today isn't what runs next week. Pin to an exact version for
+// reproducibility. UPGRADE PATH: publish the new verigent-mcp-server, then bump this one constant —
+// the audited version tracks the bump deliberately, never silently.
+const MCP_PKG = 'verigent-mcp-server@0.4.7';
 const SIT_PROMPT =
   'Run one Verigent verification cycle: call probe_start, drive each returned tool ' +
   'with probe_call branching on the actual returned values, then submit with ' +
@@ -90,9 +95,9 @@ function cmdSetup() {
   // from home. Matches the `mcp remove -s local` below; scope is disclosed in the output.
   const addArgs = ['mcp', 'add', 'verigent', '-s', 'local',
     '-e', `VERIGENT_HANDLE=${handle}`, '-e', `VERIGENT_PULL_TOKEN=${token}`,
-    '--', 'npx', '-y', 'verigent-mcp-server'];
+    '--', 'npx', '-y', MCP_PKG];
   const manualConfig = JSON.stringify({ mcpServers: { verigent: {
-    command: 'npx', args: ['-y', 'verigent-mcp-server'],
+    command: 'npx', args: ['-y', MCP_PKG],
     env: { VERIGENT_HANDLE: handle, VERIGENT_PULL_TOKEN: token } } } }, null, 2);
 
   const finish = () => console.log(`
@@ -167,9 +172,9 @@ This registers the Verigent MCP server (npm: verigent-mcp-server) at PROJECT-LOC
 scope (this folder only, not user-global) — no credentials on the free tier, and it
 changes nothing else. Package provenance is bound at
 ${SITE}/.well-known/verigent.json (verify there, not here).`);
-  const addArgs = ['mcp', 'add', 'verigent', '-s', 'local', '--', 'npx', '-y', 'verigent-mcp-server'];
+  const addArgs = ['mcp', 'add', 'verigent', '-s', 'local', '--', 'npx', '-y', MCP_PKG];
   const manualConfig = JSON.stringify({ mcpServers: { verigent: {
-    command: 'npx', args: ['-y', 'verigent-mcp-server'] } } }, null, 2);
+    command: 'npx', args: ['-y', MCP_PKG] } } }, null, 2);
   // Agents usually run this command themselves, so the agent is the likely reader of this
   // output — and installer output instructing an agent to act is exactly the shape a
   // well-defended agent should refuse (Kitt cold run, 2026-07-16: flagged as a lure).
