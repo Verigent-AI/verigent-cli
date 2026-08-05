@@ -21,7 +21,7 @@ const SITE = 'https://verigent.ai';
 // every run, so what a customer audits today isn't what runs next week. Pin to an exact version for
 // reproducibility. UPGRADE PATH: publish the new verigent-mcp-server, then bump this one constant —
 // the audited version tracks the bump deliberately, never silently.
-const MCP_PKG = 'verigent-mcp-server@0.4.7';
+const MCP_PKG = 'verigent-mcp-server@0.4.8';
 const SIT_PROMPT =
   'Run one Verigent verification cycle: call probe_start, drive each returned tool ' +
   'with probe_call branching on the actual returned values, then submit with ' +
@@ -168,10 +168,30 @@ function cmdFree() {
   // "free" shouldn't silently modify config). Provenance pointer so agents can verify the
   // package binding themselves rather than trust this output.
   console.log(`
-This registers the Verigent MCP server (npm: verigent-mcp-server) at PROJECT-LOCAL
-scope (this folder only, not user-global) — no credentials on the free tier, and it
-changes nothing else. Package provenance is bound at
-${SITE}/.well-known/verigent.json (verify there, not here).`);
+Verigent is two npm packages and one optional local job. Here's the whole picture
+before anything runs — inspect it all now, so nothing new turns up later.
+
+  1. verigent  (this CLI — the package you're running right now)
+       free      registers the server below at PROJECT-LOCAL scope (this folder only,
+                 not user-global), no credentials.  <- the only thing happening now
+       schedule  OPTIONAL, only if you run it later: installs a launchd/cron job that
+                 wakes your agent ~5x/day to sit a cycle. Holds NO credentials, and
+                 does nothing unless you invoke it.
+       handler   optional local endpoint for the sovereignty (self-hosting) test.
+     Read the source:  https://www.npmjs.com/package/verigent
+
+  2. ${MCP_PKG}  (the server 'free' registers)
+       Network-only: every tool is an HTTPS call to ${SITE}. No shell, no filesystem,
+       no scheduler, no reading your files or env. Pinned to an exact version — what
+       you audit today is what runs; upgrades are a deliberate, published version bump,
+       never a silent re-pull of 'latest'.
+     Read the source:  https://www.npmjs.com/package/verigent-mcp-server
+
+Why the ~5x/day job exists: a Verigent score is a LIVE record, not a one-off — the
+'schedule' command is how continuous verification keeps it current. It's opt-in,
+credential-free, and it lives in THIS CLI you're already reading — not a separate
+package sprung on you later. Package binding for both is committed at
+${SITE}/.well-known/verigent.json — verify there, not here.`);
   const addArgs = ['mcp', 'add', 'verigent', '-s', 'local', '--', 'npx', '-y', MCP_PKG];
   const manualConfig = JSON.stringify({ mcpServers: { verigent: {
     command: 'npx', args: ['-y', MCP_PKG] } } }, null, 2);
@@ -213,12 +233,24 @@ it to. That's by design.
     console.log(`\nNo \`claude\` CLI found — add this to your MCP client's config instead:\n\n${manualConfig}`);
     finish(); return;
   }
-  const res = run('claude', addArgs, { stdio: 'inherit' });
+  let res = run('claude', addArgs, { stdio: 'pipe' });
+  let already = false;
+  if (res.status !== 0 && `${res.stdout || ''}${res.stderr || ''}`.includes('already exists')) {
+    // Re-running `free` when it's already registered must NOT look like a failure (Ant, HN-eve:
+    // people and agents WILL re-run this; a bare exit-1 reads as "broken"). Remove + re-add so a
+    // re-run always converges on the CURRENT pinned version, then report success plainly.
+    already = true;
+    run('claude', ['mcp', 'remove', 'verigent', '-s', 'local'], { stdio: 'ignore' });
+    res = run('claude', addArgs, { stdio: 'pipe' });
+  }
   if (res.status !== 0) {
+    process.stderr.write(`${res.stdout || ''}${res.stderr || ''}`);
     console.error(`\nRegistration didn't complete (claude exited ${res.status}). Manual config:\n\n${manualConfig}`);
     process.exit(res.status ?? 1);
   }
-  console.log('\nVerigent MCP server registered (free tier — no credentials).');
+  console.log(already
+    ? '\nVerigent MCP server was already registered — refreshed to the current pinned version (free tier — no credentials).'
+    : '\nVerigent MCP server registered (free tier — no credentials).');
   finish();
 }
 
