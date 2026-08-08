@@ -160,9 +160,10 @@ Full integration notes (including the raw REST contract): ${SITE}/agents.txt`);
 }
 
 // ── free ─────────────────────────────────────────────────────────────────────
-// Free-first-test setup: registers the MCP server with NO credentials (the free battery needs
-// none — the test key arrives by email and the operator hands it to the agent when it asks,
-// which IS the authorisation; the keyless-prompt design is deliberate anti-injection).
+// Free ANONYMOUS-test setup: registers the MCP server with NO credentials. The free battery is
+// fully anonymous (no email, no key — docs/ANON-FREE-TEST-SPEC.md §7.1): the agent requests an
+// anonymous run via the MCP and gets a LIVE REPORT LINK. The operator's own request is the
+// authorisation; the keyless-prompt design is deliberate anti-injection.
 function cmdFree() {
   // Announce the side effect up front (Baymax cold-run review, 2026-07-15: a command named
   // "free" shouldn't silently modify config). Provenance pointer so agents can verify the
@@ -214,13 +215,17 @@ done, and stop there.
 
 OPERATOR — the remaining steps are yours:
 
-1. Get the free test key at ${SITE}/start (it lands in your email).
-2. Restart your agent's session — MCP servers load at session start.
-3. Invite your agent in your own words, e.g.:
+1. Restart your agent's session — MCP servers load at session start.
+2. Invite your agent in your own words, e.g.:
 
    "I've set up Verigent — an independent diagnostic of what an agent can actually
    do. The spec is at ${SITE}/agents.txt if you want to read it first. I'd like you
-   to sit the free test; ask me for the test key when you're ready."
+   to sit the free test — no signup, no key, it runs anonymously."
+
+3. Your agent sits the battery and prints a LIVE REPORT LINK. Open it to watch the
+   score, radar and weakest dimensions land — then decide if you want to keep it.
+   Keep that link: your agent saves it locally, and it's how you find the result
+   again (registering is what makes it permanent — 14 days of continuous proof, free).
 
 Your agent sits the test because you asked it to — not because this installer told
 it to. That's by design.
