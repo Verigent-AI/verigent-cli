@@ -47,7 +47,7 @@ const grantLine = (handle) =>
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] && !argv[0].startsWith('-') && !argv[0].startsWith('vgp_') &&
-  ['schedule', 'handler', 'setup', 'free', 'help'].includes(argv[0]) ? argv.shift() : 'setup';
+  ['schedule', 'handler', 'setup', 'free', 'register', 'help'].includes(argv[0]) ? argv.shift() : 'setup';
 const dryRun = argv.includes('--dry-run');
 const flags = {};
 const positional = [];
@@ -67,6 +67,9 @@ Verigent — verification for AI agents. ${SITE}
 
 Usage:
   npx verigent free                     free onboarding test: registers the MCP server, no credentials
+  npx verigent register --token <t> --name <AgentName> --email <you@example.com>
+                                        keep a free result: claims the handle + starts continuous
+                                        verification NOW; confirm the emailed link to lock in the key
   npx verigent <handle> <vgp_token>     complete setup: MCP server + the ~5x/day pull job
                                         (--no-schedule to skip the scheduler)
   npx verigent schedule <handle>        install the ~5x/day challenge-pull job (--uninstall to remove)
@@ -226,6 +229,16 @@ OPERATOR — the remaining steps are yours:
    score, radar and weakest dimensions land — then decide if you want to keep it.
    Keep that link: your agent saves it locally, and it's how you find the result
    again (registering is what makes it permanent — 14 days of continuous proof, free).
+
+4. Keep it (optional): registering claims the handle and starts continuous
+   verification straight away — pulls begin now, and a confirmation email locks in
+   the handle + key in parallel. Your agent can do this for you in one line:
+
+     npx verigent register --token <report-link-token> --name <AgentName> --email <you@example.com>
+
+   If your agent already knows your email it'll offer "Want me to register your
+   email? (y/n)"; if not, it'll ask you for one. No payment — the free window runs
+   either way; the email just makes the handle and key permanently yours.
 
 Your agent sits the test because you asked it to — not because this installer told
 it to. That's by design.
@@ -406,8 +419,67 @@ Controls → Sovereignty testing. Docs: ${SITE}/agents.txt`);
   });
 }
 
+// ── register ───────────────────────────────────────────────────────────────
+// Agent-mediated PROVISIONAL registration (Ant 2026-08-16). Run this after the free test to KEEP the
+// result: it claims the handle + owner email and starts continuous verification PROVISIONALLY — pulls
+// begin immediately, while the email-confirm magic-link runs in PARALLEL to lock in the handle + VG
+// key. One authorised HTTPS call to the public /api/free/promote — nothing else touches your machine.
+//
+// The email is the OPERATOR's authorisation, supplied explicitly — never inferred. An agent acting on
+// its operator's behalf uses the conditional prompt:
+//   • already knows the operator's email →  "Want me to register your email? (y/n)"  → pass --email
+//   • doesn't know it                     →  "Give me your email to claim the handle" → pass --email
+async function cmdRegister() {
+  const token = flags.token || positional[0];
+  const name = flags.name || positional[1];
+  const email = flags.email;
+  if (!token) {
+    console.error('Usage: npx verigent register --token <run-or-track-token> --name <AgentName> --email <you@example.com>\n\nThe token is in the report link your free test printed.');
+    process.exit(1);
+  }
+  if (!name) {
+    console.error("What's your agent called? Re-run with --name <AgentName> — the first agent verified under a name keeps it.");
+    process.exit(1);
+  }
+  if (!email) {
+    // Unknown-email prompt — the conversational cue for an agent registering on its operator's behalf.
+    console.log(`Give me your email to claim the handle — it's where your confirmation link and freshness updates go. Then re-run:
+
+  npx verigent register --token ${token} --name ${name} --email you@example.com
+
+No payment, no catch: the free window runs either way — the email just locks in the handle and mints the key.`);
+    process.exit(1);
+  }
+  if (dryRun) { console.log(`[dry-run] POST ${SITE}/api/free/promote  { token, agentName: ${name}, email: ${email} }`); return; }
+  let res, data;
+  try {
+    res = await fetch(`${SITE}/api/free/promote`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, agentName: name, email }),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    console.error(`Couldn't reach ${SITE}: ${e.message}. Try again in a moment.`);
+    process.exit(1);
+  }
+  if (!res.ok || !data.ok) {
+    console.error(`Registration didn't complete: ${data.detail || data.error || `HTTP ${res.status}`}`);
+    process.exit(1);
+  }
+  const handle = data.handle || name;
+  console.log(`
+${name} is registered and verifying now — free for 14 days. It's already testing; there's nothing you must do to keep the free run going.
+
+Keep it pulling continuously (installs the ~5x/day job, holds no credentials):
+
+  npx verigent schedule ${handle}
+
+Then check your inbox: click the confirmation link to lock in ${handle} permanently and mint its verification key. Your 14 days free are already running either way.`);
+}
+
 if (cmd === 'help' || argv.includes('--help')) usage();
 else if (cmd === 'schedule') cmdSchedule();
 else if (cmd === 'handler') cmdHandler();
 else if (cmd === 'free') cmdFree();
+else if (cmd === 'register') cmdRegister();
 else cmdSetup();
