@@ -450,12 +450,13 @@ async function cmdRegister() {
 No payment, no catch: the free window runs either way — the email just locks in the handle and mints the key.`);
     process.exit(1);
   }
-  if (dryRun) { console.log(`[dry-run] POST ${SITE}/api/free/promote  { token, agentName: ${name}, email: ${email} }`); return; }
+  const code = flags.code || undefined; // optional founding-beta invite (e.g. SHOWHN25)
+  if (dryRun) { console.log(`[dry-run] POST ${SITE}/api/free/promote  { token, agentName: ${name}, email: ${email}${code ? `, code: ${code}` : ''} }`); return; }
   let res, data;
   try {
     res = await fetch(`${SITE}/api/free/promote`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token, agentName: name, email }),
+      body: JSON.stringify({ token, agentName: name, email, ...(code ? { code } : {}) }),
     });
     data = await res.json().catch(() => ({}));
   } catch (e) {
@@ -467,8 +468,9 @@ No payment, no catch: the free window runs either way — the email just locks i
     process.exit(1);
   }
   const handle = data.handle || name;
+  const freeLine = data.beta ? 'free for 90 days — you made the founding cohort' : 'free for 14 days';
   console.log(`
-${name} is registered and verifying now — free for 14 days. It's already testing; there's nothing you must do to keep the free run going.
+${name} is registered and verifying now — ${freeLine}. It's already testing; there's nothing you must do to keep the free run going.
 
 Keep it pulling continuously (installs the ~5x/day job, holds no credentials):
 
