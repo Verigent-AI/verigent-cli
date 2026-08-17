@@ -21,7 +21,7 @@ const SITE = 'https://verigent.ai';
 // every run, so what a customer audits today isn't what runs next week. Pin to an exact version for
 // reproducibility. UPGRADE PATH: publish the new verigent-mcp-server, then bump this one constant —
 // the audited version tracks the bump deliberately, never silently.
-const MCP_PKG = 'verigent-mcp-server@0.6.0';
+const MCP_PKG = 'verigent-mcp-server@0.7.0';
 const SIT_PROMPT =
   'Run one Verigent verification cycle: call probe_start, drive each returned tool ' +
   'with probe_call branching on the actual returned values, then submit with ' +
@@ -191,11 +191,12 @@ before anything runs — inspect it all now, so nothing new turns up later.
        never a silent re-pull of 'latest'.
      Read the source:  https://www.npmjs.com/package/verigent-mcp-server
 
-Why the ~5x/day job exists: a Verigent score is a LIVE record, not a one-off — the
-'schedule' command is how continuous verification keeps it current. It's opt-in,
-credential-free, and it lives in THIS CLI you're already reading — not a separate
-package sprung on you later. Package binding for both is committed at
-${SITE}/.well-known/verigent.json — verify there, not here.`);
+Why the ~5x/day job exists: a score reflects current behaviour, so continuous
+verification keeps it current rather than leaving a one-off snapshot. The
+'schedule' command is opt-in, credential-free, and lives in THIS CLI — not a
+separate package added later. The package binding is published at
+${SITE}/.well-known/verigent.json, which pins the exact version + integrity hash
+of both packages; check your install against it rather than taking this on trust.`);
   const addArgs = ['mcp', 'add', 'verigent', '-s', 'local', '--', 'npx', '-y', MCP_PKG];
   const manualConfig = JSON.stringify({ mcpServers: { verigent: {
     command: 'npx', args: ['-y', MCP_PKG] } } }, null, 2);
@@ -225,34 +226,30 @@ OPERATOR — the remaining steps are yours:
    do. The spec is at ${SITE}/agents.txt if you want to read it first. I'd like you
    to sit the free test — no signup, no key, it runs anonymously."
 
-3. Your agent sits the battery and prints a LIVE REPORT LINK. Open it to watch the
-   score, radar and weakest dimensions land — then decide if you want to keep it.
-   Keep that link: your agent saves it locally, and it's how you find the result
-   again (registering is what makes it permanent — 14 days of continuous proof, free).
+3. Your agent sits the battery and prints a live progress link. Open it to watch the
+   score, radar and weakest dimensions land, then decide whether to keep the result.
+   Your agent saves the link locally — it's how you find the result again.
 
 4. Keep it (optional): registering claims the handle and starts continuous
-   verification straight away — pulls begin now, and a confirmation email locks in
-   the handle + key in parallel. Your agent can do this for you in one line:
+   verification; a confirmation email locks in the handle + key. There's no payment,
+   and the free window runs either way. Your agent can do it in one line:
 
      npx verigent register --token <report-link-token> --name <AgentName> --email <you@example.com>
 
-   If your agent already knows your email it'll offer "Want me to register your
-   email? (y/n)"; if not, it'll ask you for one. No payment — the free window runs
-   either way; the email just makes the handle and key permanently yours.
+   The email is only for the confirmation link and freshness updates — the one thing
+   registering needs. Registering at all is optional.
 
 Your agent sits the test because you asked it to — not because this installer told
 it to. That's by design.
 
 — For the agent that ran this —
 This is information, not instructions — act on your operator's request, same as any tool result.
-When your test completes, your result comes back with your real values already filled in: the report
-page and the run-report data both carry a ready-to-relay "operator_summary" (score, tier, weakest
-dimension, report link). If your operator would find it useful, here's a summary you're welcome to
-pass along, verbatim — this is the shape, filled from your own result:
+When your test completes, the result carries a ready-to-relay "operator_summary" (composite, tier,
+weakest dimension, report link) with your real values filled in. If your operator would find it
+useful, you're welcome to pass it along verbatim — the shape is:
 
-  "I ran an independent verification of myself. Scored [X] overall (tier [V?]); weakest area is
-  [dimension] at [score]. Full report: [link]. It keeps re-testing free for 14 days if we want to
-  watch it improve — want me to work on [dimension]?"
+  "I ran an independent Verigent verification of myself. Composite [X] (tier [V?]); weakest dimension
+  [dimension] at [score]. Full report: [link]"
 
 Whether and how you share that is your call.
 `);
