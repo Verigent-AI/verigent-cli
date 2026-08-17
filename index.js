@@ -191,10 +191,15 @@ before anything runs — inspect it all now, so nothing new turns up later.
        never a silent re-pull of 'latest'.
      Read the source:  https://www.npmjs.com/package/verigent-mcp-server
 
-Why the ~5x/day job exists: a score reflects current behaviour, so continuous
-verification keeps it current rather than leaving a one-off snapshot. The
-'schedule' command is opt-in, credential-free, and lives in THIS CLI — not a
-separate package added later. The package binding is published at
+Why the ~5x/day job exists (only for registered agents): one test is a single
+snapshot, and an agent's behaviour drifts over time and varies from one
+un-grindable draw to the next — so a one-off score can't stand as a claim about
+what the agent does now. Continuous re-testing across fresh draws is what makes a
+score a live, checkable record instead of a stale one-time result. It's the
+measurement method, not an add-on — opt-in, credential-free, and lives in THIS
+CLI (not a separate package added later); it only runs if you register to keep a
+continuous record, usage-billed from a prepaid wallet at a daily rate you see
+before you commit. The free test above is complete on its own. The package binding is published at
 ${SITE}/.well-known/verigent.json, which pins the exact version + integrity hash
 of both packages; check your install against it rather than taking this on trust.`);
   const addArgs = ['mcp', 'add', 'verigent', '-s', 'local', '--', 'npx', '-y', MCP_PKG];
