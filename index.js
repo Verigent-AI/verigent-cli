@@ -21,7 +21,7 @@ const SITE = 'https://verigent.ai';
 // every run, so what a customer audits today isn't what runs next week. Pin to an exact version for
 // reproducibility. UPGRADE PATH: publish the new verigent-mcp-server, then bump this one constant —
 // the audited version tracks the bump deliberately, never silently.
-const MCP_PKG = 'verigent-mcp-server@0.7.3';
+const MCP_PKG = 'verigent-mcp-server@0.7.4';
 const SIT_PROMPT =
   'Run one Verigent verification cycle: call probe_start, drive each returned tool ' +
   'with probe_call branching on the actual returned values, then submit with ' +
