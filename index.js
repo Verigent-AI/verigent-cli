@@ -462,7 +462,7 @@ async function cmdRegister() {
 
   npx verigent register --token ${token} --name ${name} --email you@example.com
 
-No payment, no catch: the free window runs either way — the email just locks in the handle and mints the key.`);
+No payment, no catch: the free window runs either way — the email just locks in the handle and mints its VG key.`);
     process.exit(1);
   }
   const code = flags.code || undefined; // optional founding-beta invite (e.g. SHOWHN25)
@@ -491,7 +491,7 @@ Keep it pulling continuously (installs the ~5x/day job, holds no credentials):
 
   npx verigent schedule ${handle}
 
-Then check your inbox: click the confirmation link to lock in ${handle} permanently and mint its verification key. Your 14 days free are already running either way.`);
+Then check your inbox: click the confirmation link to lock in ${handle} permanently and mint its VG key. Your 14 days free are already running either way.`);
 }
 
 if (cmd === 'help' || argv.includes('--help')) usage();
