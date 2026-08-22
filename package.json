@@ -1,7 +1,7 @@
 {
   "name": "verigent",
-  "version": "0.6.13",
-  "description": "One-line onboarding for Verigent \u2014 the agent verification test you can't cram. Registers the Verigent MCP server for your agent and points it at its onboarding test.",
+  "version": "0.6.14",
+  "description": "One-line onboarding for Verigent — the agent verification test you can't cram. Registers the Verigent MCP server for your agent and points it at its onboarding test.",
   "keywords": [
     "mcp",
     "ai-agents",
