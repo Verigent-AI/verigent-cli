@@ -21,7 +21,7 @@ const SITE = 'https://verigent.ai';
 // every run, so what a customer audits today isn't what runs next week. Pin to an exact version for
 // reproducibility. UPGRADE PATH: publish the new verigent-mcp-server, then bump this one constant —
 // the audited version tracks the bump deliberately, never silently.
-const MCP_PKG = 'verigent-mcp-server@0.7.7';
+const MCP_PKG = 'verigent-mcp-server@0.7.8';
 const SIT_PROMPT =
   'Run one Verigent verification cycle: call probe_start, drive each returned tool ' +
   'with probe_call branching on the actual returned values, then submit with ' +
@@ -46,8 +46,18 @@ const grantLine = (handle) =>
   `this; Verigent never asks you to authorise it yourself.`;
 
 const argv = process.argv.slice(2);
-const cmd = argv[0] && !argv[0].startsWith('-') && !argv[0].startsWith('vgp_') &&
-  ['schedule', 'handler', 'setup', 'free', 'register', 'help'].includes(argv[0]) ? argv.shift() : 'setup';
+// Subcommand resolution. A leading known keyword wins. Otherwise: a bare `npx verigent`
+// (no positional args) runs the FREE onboarding test — the one-command front door the site
+// advertises — while `npx verigent <handle> <vgp_token>` (positional creds, no keyword) stays the
+// paid setup form. Before 2026-09-04 the no-keyword default was 'setup', so bare `npx verigent`
+// fell through to a usage screen instead of actually sitting the test (site⇄CLI drift, Kit cold run).
+const KNOWN_CMDS = ['schedule', 'handler', 'setup', 'free', 'register', 'help'];
+let cmd;
+if (argv[0] && !argv[0].startsWith('-') && KNOWN_CMDS.includes(argv[0])) {
+  cmd = argv.shift();
+} else {
+  cmd = argv.some((a) => !a.startsWith('-')) ? 'setup' : 'free';
+}
 const dryRun = argv.includes('--dry-run');
 const flags = {};
 const positional = [];
@@ -66,6 +76,7 @@ function usage(code = 0) {
 Verigent — verification for AI agents. ${SITE}
 
 Usage:
+  npx verigent                          runs the free onboarding test (same as 'free' below)
   npx verigent free                     free onboarding test: registers the MCP server, no credentials
   npx verigent register --token <t> --name <AgentName> --email <you@example.com>
                                         keep a free result: claims the handle + starts continuous
@@ -197,9 +208,10 @@ un-grindable draw to the next — so a one-off score can't stand as a claim abou
 what the agent does now. Continuous re-testing across fresh draws is what makes a
 score a live, checkable record instead of a stale one-time result. It's the
 measurement method, not an add-on — opt-in, credential-free, and lives in THIS
-CLI (not a separate package added later); it only runs if you register to keep a
-continuous record, usage-billed from a prepaid wallet at a daily rate you see
-before you commit. The free test above is complete on its own. The package binding is published at
+CLI (not a separate package added later); it only runs for agents that register
+for continuous verification — an optional paid subscription, billed as a flat
+annual plan (a one-off deep diagnostic is also available). The free test above is
+complete on its own, and nothing here bills you. The package binding is published at
 ${SITE}/.well-known/verigent.json, which pins the exact version + integrity hash
 of both packages; check your install against it rather than taking this on trust.`);
   const addArgs = ['mcp', 'add', 'verigent', '-s', 'local', '--', 'npx', '-y', MCP_PKG];
@@ -465,7 +477,7 @@ async function cmdRegister() {
 No payment, no catch: the free window runs either way — the email just locks in the handle and mints its VG key.`);
     process.exit(1);
   }
-  const code = flags.code || undefined; // optional founding-beta invite (e.g. SHOWHN25)
+  const code = flags.code || undefined; // optional early-bird invite code (e.g. SHOWHN25)
   if (dryRun) { console.log(`[dry-run] POST ${SITE}/api/free/promote  { token, agentName: ${name}, email: ${email}${code ? `, code: ${code}` : ''} }`); return; }
   let res, data;
   try {
@@ -483,7 +495,7 @@ No payment, no catch: the free window runs either way — the email just locks i
     process.exit(1);
   }
   const handle = data.handle || name;
-  const freeLine = data.beta ? 'free for 90 days — you made the founding cohort' : 'free for 14 days';
+  const freeLine = data.beta ? 'free for 90 days' : 'free for 14 days';
   console.log(`
 ${name} is registered and verifying now — ${freeLine}. It's already testing; there's nothing you must do to keep the free run going.
 
