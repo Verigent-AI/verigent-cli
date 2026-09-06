@@ -48,11 +48,23 @@ const argv = process.argv.slice(2);
 // paid setup form. Before 2026-09-04 the no-keyword default was 'setup', so bare `npx verigent`
 // fell through to a usage screen instead of actually sitting the test (site⇄CLI drift, Kit cold run).
 const KNOWN_CMDS = ['schedule', 'handler', 'setup', 'free', 'register', 'help'];
+// Personal COMP CODE (Ant 2026-09-06, VG-115): `npx verigent <code>` — the bare second argument IS the
+// code (their name, e.g. `deshraj`), no flags, no prefix. Shape mirrors COMP_CODE_RE in
+// functions/lib/comp-ladder.ts (this package can't import it; a repo test asserts they match). A single
+// positional that isn't a subcommand word or a vgp_ token is a code → the FREE test runs with the code
+// attached at first touch. An unrecognised code never blocks the test — one plain line says so.
+const COMP_CODE_RE = /^[a-z0-9][a-z0-9-]{1,31}$/;
+const bare = argv.filter((a) => !a.startsWith('-'));
 let cmd;
+let compCode = null;
 if (argv[0] && !argv[0].startsWith('-') && KNOWN_CMDS.includes(argv[0])) {
   cmd = argv.shift();
+} else if (bare.length === 1 && COMP_CODE_RE.test(bare[0]) && !bare[0].startsWith('vgp_')) {
+  compCode = bare[0];
+  argv.splice(argv.indexOf(bare[0]), 1);
+  cmd = 'free';
 } else {
-  cmd = argv.some((a) => !a.startsWith('-')) ? 'setup' : 'free';
+  cmd = bare.length ? 'setup' : 'free';
 }
 const dryRun = argv.includes('--dry-run');
 const flags = {};
@@ -73,6 +85,7 @@ Verigent — verification for AI agents. ${SITE}
 
 Usage:
   npx verigent                          runs the free onboarding test (same as 'free' below)
+  npx verigent <code>                   the same free test with your personal code attached
   npx verigent free                     free onboarding test: registers the MCP server, no credentials
   npx verigent register --token <t> --name <AgentName> --email <you@example.com>
                                         keep a free result: claims the handle + starts continuous
@@ -169,7 +182,24 @@ Full integration notes (including the raw REST contract): ${SITE}/agents.txt`);
 // fully anonymous (no email, no key — docs/ANON-FREE-TEST-SPEC.md §7.1): the agent requests an
 // anonymous run via the MCP and gets a LIVE REPORT LINK. The operator's own request is the
 // authorisation; the keyless-prompt design is deliberate anti-injection.
-function cmdFree() {
+async function cmdFree() {
+  // Personal comp code (VG-115): check it ONCE, best-effort, so an unrecognised code gets one plain line
+  // now (the run itself happens later via the MCP server, which carries the code in its env as
+  // VERIGENT_CODE → anon-start `code`). Network trouble → say nothing, carry on; the server re-validates.
+  let codeEnv = [];
+  if (compCode) {
+    codeEnv = ['-e', `VERIGENT_CODE=${compCode}`];
+    if (!dryRun) {
+      try {
+        const r = await fetch(`${SITE}/api/free/comp-code?code=${encodeURIComponent(compCode)}`);
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d && d.recognised === false) {
+          console.log(`\nThat code wasn't recognised — the free test runs without it.`);
+          codeEnv = [];
+        }
+      } catch { /* offline / transient — the server re-validates at run start */ }
+    }
+  }
   // Announce the side effect up front (Baymax cold-run review, 2026-07-15: a command named
   // "free" shouldn't silently modify config). Provenance pointer so agents can verify the
   // package binding themselves rather than trust this output.
@@ -193,11 +223,13 @@ Three levels of verification:
                  verified record. Pricing at ${SITE}.
 
 The server loads on the next session start; there's nothing you need to do now.`;
-  const addArgs = ['mcp', 'add', 'verigent', '-s', 'local', '--', 'npx', '-y', MCP_PKG];
+  const addArgs = ['mcp', 'add', 'verigent', '-s', 'local', ...codeEnv, '--', 'npx', '-y', MCP_PKG];
   const manualConfig = JSON.stringify({ mcpServers: { verigent: {
-    command: 'npx', args: ['-y', MCP_PKG] } } }, null, 2);
+    command: 'npx', args: ['-y', MCP_PKG],
+    ...(codeEnv.length ? { env: { VERIGENT_CODE: compCode } } : {}) } } }, null, 2);
+  const codeLine = codeEnv.length ? `\nYour code (${compCode}) is attached — it rides the free run; the report shows what it covers.` : '';
   // The receipt prints AFTER the outcome line; the header varies by branch, BODY is shared.
-  const finish = (headerLine) => console.log(`\n${headerLine}\n${BODY}`);
+  const finish = (headerLine) => console.log(`\n${headerLine}${codeLine}\n${BODY}`);
   if (dryRun) {
     console.log(`[dry-run] claude ${addArgs.join(' ')}`);
     finish('Verigent MCP server registered — project-local (this folder only), free tier. [dry-run]'); return;
@@ -434,6 +466,6 @@ Record: ${SITE}/agent/${handle}
 if (cmd === 'help' || argv.includes('--help')) usage();
 else if (cmd === 'schedule') cmdSchedule();
 else if (cmd === 'handler') cmdHandler();
-else if (cmd === 'free') cmdFree();
+else if (cmd === 'free') await cmdFree();
 else if (cmd === 'register') cmdRegister();
 else cmdSetup();
