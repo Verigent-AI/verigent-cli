@@ -21,7 +21,14 @@ const SITE = 'https://verigent.ai';
 // every run, so what a customer audits today isn't what runs next week. Pin to an exact version for
 // reproducibility. UPGRADE PATH: publish the new verigent-mcp-server, then bump this one constant —
 // the audited version tracks the bump deliberately, never silently.
-const MCP_PKG = 'verigent-mcp-server@0.7.8';
+// K-2 (2026-09-15 stranger walk): this constant drifted to 0.7.8 while public/.well-known/verigent.json
+// (the canonical binding) pinned 0.7.10, so the advertised "verify your install against the binding
+// file" step failed for every stranger who checked. Realigned to the binding's CURRENT published
+// pin (never a version that hasn't shipped its real hash yet — that would be its own lie). The next
+// mcp-server publish bumps this constant + the binding + its hash together, same release ritual as
+// always; professor/binding-check.mjs now parses this exact line and fails the build the moment it
+// next drifts from official_packages.npm.version.
+const MCP_PKG = 'verigent-mcp-server@0.7.11';
 const CYCLE_PROMPT =
   'Run one Verigent verification cycle under the operator authorisation recorded in your config: ' +
   'call probe_start, drive each returned tool with probe_call branching on the actual returned ' +
@@ -130,8 +137,13 @@ Verigent MCP server registered for ${handle} — project-local (this folder only
   • Network-only: every tool is an HTTPS call to ${SITE}. No shell or filesystem access.
   • Pinned to ${MCP_PKG}.  Verify the install:  claude mcp get verigent
   • Package binding + integrity hashes: ${SITE}/.well-known/verigent.json
+  • Your agent's client may ask you to approve mcp__verigent tool calls the
+    first time it uses them (HTTPS to ${SITE} only). Approve them, or add
+    mcp__verigent to its allow list — Verigent never grants this for you.
 
-Loads on the next session start. This agent's record: ${SITE}/agent/${handle}
+Next:
+  1. Restart your agent session (the MCP server loads on start — it isn't loaded yet).
+  2. This agent's record: ${SITE}/agent/${handle}
 `);
 
   if (dryRun) {
@@ -222,7 +234,14 @@ Three levels of verification:
   • Continuous   annual — repeated un-grindable runs over time; a live, checkable
                  verified record. Pricing at ${SITE}.
 
-The server loads on the next session start; there's nothing you need to do now.`;
+  • Your agent's client may ask you to approve mcp__verigent tool calls the
+    first time it uses them (HTTPS to ${SITE} only). Approve them, or add
+    mcp__verigent to its allow list — Verigent never grants this for you.
+
+Next:
+  1. Restart your agent session (the MCP server loads on start — it isn't loaded yet).
+  2. Tell your agent: sit the Verigent test.
+  3. Watch the run at the tracker link your agent prints when it starts.`;
   const addArgs = ['mcp', 'add', 'verigent', '-s', 'local', ...codeEnv, '--', 'npx', '-y', MCP_PKG];
   const manualConfig = JSON.stringify({ mcpServers: { verigent: {
     command: 'npx', args: ['-y', MCP_PKG],
