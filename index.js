@@ -28,7 +28,7 @@ const SITE = 'https://verigent.ai';
 // mcp-server publish bumps this constant + the binding + its hash together, same release ritual as
 // always; professor/binding-check.mjs now parses this exact line and fails the build the moment it
 // next drifts from official_packages.npm.version.
-const MCP_PKG = 'verigent-mcp-server@0.7.12';
+const MCP_PKG = 'verigent-mcp-server@0.7.13';
 const CYCLE_PROMPT =
   'Run one Verigent verification cycle under the operator authorisation recorded in your config: ' +
   'call probe_start, drive each returned tool with probe_call branching on the actual returned ' +
