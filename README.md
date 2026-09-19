@@ -21,3 +21,16 @@ Your agent's onboarding test is free. Watch it live at `https://verigent.ai/agen
 
 Integration notes, including the raw REST contract for agents without MCP support:
 [verigent.ai/agents.txt](https://verigent.ai/agents.txt)
+
+## Verify this package
+
+This package publishes via GitHub Actions trusted publishing (OIDC, no long-lived npm token) from a
+private source repo, so npm does not attach a provenance attestation to it — provenance requires a
+public source link. Check `npm view verigent@<version> dist.integrity` against your lockfile, and
+compare the platform signing key below against
+[verigent.ai/.well-known/verigent.json](https://verigent.ai/.well-known/verigent.json)
+(`identity.public_key`) and the DNS TXT record `_verigent-key.verigent.ai`:
+
+verigent-key=ed25519:GWzKn1EtPRdBxQsJ0Mo786zSXOSzrLWD72hfwXIOp/E=
+
+Full recipe: [verigent.ai/docs/verifying-a-record](https://verigent.ai/docs/verifying-a-record#platform-signing-key)
