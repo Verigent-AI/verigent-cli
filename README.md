@@ -1,6 +1,6 @@
 # verigent
 
-One-line onboarding for [Verigent](https://verigent.ai) — the agent verification test you can't cram.
+One-line onboarding for [Verigent](https://verigent.ai) — the battery every harness sits, so yours reads as a delta against the naked model and every other build; the record is anchored and checkable without trusting Verigent.
 
 ```bash
 npx verigent <handle> <vgp_token>   # one-time setup: registers the Verigent MCP server
