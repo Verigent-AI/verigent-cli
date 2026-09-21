@@ -1,0 +1,63 @@
+name: Publish CLI to npm
+
+# Trusted publishing (OIDC) WITH build provenance — no NPM_TOKEN anywhere. This repo is PUBLIC
+# (Verigent-AI/verigent-cli, split out of the private monorepo 2026-09-22 on Ant's ruling after Kit's
+# install audit), so npm attaches a SLSA provenance attestation tying the published tarball to the
+# exact commit and workflow that built it — the same guarantee the mcp-server package already carries.
+#
+# Requires the npmjs.com "Trusted Publisher" binding on the `verigent` package to name THIS repo and
+# THIS workflow filename (org Verigent-AI, repo verigent-cli, workflow cli-publish.yml) — see
+# RELEASING.md "One-time setup". Until that binding is moved, a tag push here will fail auth (safe).
+#
+# Tag scheme is cli-vX.Y.Z — deliberately distinct from the mcp-server repo's vX.Y.Z so a tag push
+# can never be misread as targeting the wrong package.
+
+on:
+  push:
+    tags:
+      - 'cli-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required to mint the OIDC token trusted publishing exchanges for a publish token
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs npm >= 11.5.1; the npm bundled with setup-node's Node build can be
+      # older, so pin it explicitly rather than trusting whatever ships that week.
+      - name: Ensure npm is new enough for trusted publishing
+        run: npm install -g npm@latest && npm --version
+
+      - name: Syntax check (the CLI has no build step — this is the cheapest pre-publish gate)
+        run: node --check index.js
+
+      - name: Check if this version is already on npm
+        id: check
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          echo "pkg_name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+          echo "pkg_version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "$PKG_NAME@$PKG_VERSION" version >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm with provenance (idempotent — skips if this version is already live)
+        if: steps.check.outputs.already_published == 'false'
+        run: npm publish --provenance --access public
+
+      - name: Already published — skipping
+        if: steps.check.outputs.already_published == 'true'
+        run: echo "::notice::${{ steps.check.outputs.pkg_name }}@${{ steps.check.outputs.pkg_version }} is already on npm — nothing to do (idempotent re-run)."
