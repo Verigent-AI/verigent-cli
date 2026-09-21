@@ -99,6 +99,8 @@ Usage:
                                         verification NOW; confirm the emailed link to lock in the key
   npx verigent <handle> <vgp_token>     complete setup: MCP server + the ~5x/day pull job
                                         (--no-schedule to skip the scheduler)
+                                        [--harness-version <v>]  declare your build version on every
+                                        pull (or set VERIGENT_HARNESS_VERSION); keys the version delta
   npx verigent schedule <handle>        install the ~5x/day challenge-pull job (--uninstall to remove)
                                         [--cwd <agent dir>] [--allow <extra,allowed,tools>]
                                         [--env KEY=VALUE ...]  extra env for the job (e.g. CLAUDE_CONFIG_DIR)
@@ -123,12 +125,17 @@ function cmdSetup() {
   // -s local (Greg #3 / §2 trust surface): register at PROJECT-LOCAL scope — this folder only, not
   // user-global (`~`), so the server is not silently in scope for every session the operator starts
   // from home. Matches the `mcp remove -s local` below; scope is disclosed in the output.
+  // DECLARED harness version (spec 20260921 item A): `--harness-version <v>` or VERIGENT_HARNESS_VERSION
+  // in the environment rides into the MCP server's env, which sends it on every probe_start /
+  // start_verification. Declared, never verified — it keys the record's version delta.
+  const harnessVersion = String(flags['harness-version'] || process.env.VERIGENT_HARNESS_VERSION || '').trim().slice(0, 40);
+  const hvArgs = harnessVersion ? ['-e', `VERIGENT_HARNESS_VERSION=${harnessVersion}`] : [];
   const addArgs = ['mcp', 'add', 'verigent', '-s', 'local',
-    '-e', `VERIGENT_HANDLE=${handle}`, '-e', `VERIGENT_PULL_TOKEN=${token}`,
+    '-e', `VERIGENT_HANDLE=${handle}`, '-e', `VERIGENT_PULL_TOKEN=${token}`, ...hvArgs,
     '--', 'npx', '-y', MCP_PKG];
   const manualConfig = JSON.stringify({ mcpServers: { verigent: {
     command: 'npx', args: ['-y', MCP_PKG],
-    env: { VERIGENT_HANDLE: handle, VERIGENT_PULL_TOKEN: token } } } }, null, 2);
+    env: { VERIGENT_HANDLE: handle, VERIGENT_PULL_TOKEN: token, ...(harnessVersion ? { VERIGENT_HARNESS_VERSION: harnessVersion } : {}) } } } }, null, 2);
 
   // Neutral receipt (see cmdFree): facts + verify pointers + record link, zero requests of the reader.
   const finish = () => console.log(`
