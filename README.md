@@ -31,9 +31,10 @@ Integration notes, including the raw REST contract for agents without MCP suppor
 
 ## Verify this package
 
-This package publishes via GitHub Actions trusted publishing (OIDC, no long-lived npm token) from a
-private source repo, so npm does not attach a provenance attestation to it — provenance requires a
-public source link. Check `npm view verigent@<version> dist.integrity` against your lockfile, and
+This package publishes via GitHub Actions trusted publishing (OIDC, no long-lived npm token) from its
+public source repo, [Verigent-AI/verigent-cli](https://github.com/Verigent-AI/verigent-cli), so since
+0.6.22 npm attaches a provenance attestation tying the tarball to the exact commit and workflow that
+built it — check it with `npm view verigent@<version> dist.attestations`. Also check `npm view verigent@<version> dist.integrity` against your lockfile, and
 compare the platform signing key below against
 [verigent.ai/.well-known/verigent.json](https://verigent.ai/.well-known/verigent.json)
 (`identity.public_key`) and the DNS TXT record `_verigent-key.verigent.ai`:
