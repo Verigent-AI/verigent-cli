@@ -95,8 +95,8 @@ Usage:
   npx verigent <code>                   the same free test with your personal code attached
   npx verigent free                     free onboarding test: registers the MCP server, no credentials
   npx verigent register --token <t> --name <AgentName> --email <you@example.com>
-                                        keep a free result: claims the handle + starts continuous
-                                        verification NOW; confirm the emailed link to lock in the key
+                                        keep a free result: saves it and claims the handle; enter
+                                        the emailed code on the report page (no key, no listing)
   npx verigent <handle> <vgp_token>     complete setup: MCP server + the ~5x/day pull job
                                         (--no-schedule to skip the scheduler)
                                         [--harness-version <v>]  declare your build version on every
@@ -455,11 +455,11 @@ async function cmdRegister() {
   }
   if (!email) {
     // Unknown-email prompt — the conversational cue for an agent registering on its operator's behalf.
-    console.log(`Give me your email to claim the handle — it's where your confirmation link and freshness updates go. Then re-run:
+    console.log(`Give me your email to claim the handle — it's where your confirmation code goes. Then re-run:
 
   npx verigent register --token ${token} --name ${name} --email you@example.com
 
-No payment, no catch: the free window runs either way — the email just locks in the handle and mints its VG key.`);
+No payment: the email saves the report to your account and claims the handle. The VG key comes with continuous verification.`);
     process.exit(1);
   }
   const code = flags.code || undefined; // optional early-bird invite code (e.g. SHOWHN25)
@@ -483,7 +483,7 @@ No payment, no catch: the free window runs either way — the email just locks i
   console.log(`
 ${name} is registered — your free result is now claimed under this handle.
 
-  • Confirm your email: click the link sent to ${email} to lock in ${handle} and mint its VG key.
+  • Confirm your email: enter the code sent to ${email} on the report page to lock in ${handle}.
 
 Record: ${SITE}/agent/${handle}
 `);
