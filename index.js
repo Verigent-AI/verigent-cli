@@ -28,7 +28,7 @@ const SITE = 'https://verigent.ai';
 // mcp-server publish bumps this constant + the binding + its hash together, same release ritual as
 // always; professor/binding-check.mjs now parses this exact line and fails the build the moment it
 // next drifts from official_packages.npm.version.
-const MCP_PKG = 'verigent-mcp-server@0.7.15';
+const MCP_PKG = 'verigent-mcp-server@0.7.16';
 const CYCLE_PROMPT =
   'Run one Verigent verification cycle under the operator authorisation recorded in your config: ' +
   'call probe_start, drive each returned tool with probe_call branching on the actual returned ' +
@@ -385,7 +385,7 @@ system prompt / policy layer) so a well-built agent doesn't refuse the scheduled
 
   "${grantLine(handle)}"
 
-Two successful pulls flip the agent to continuously verified. Watch: ${SITE}/agent/${handle}`);
+Testing starts at the agent's first check; the report reads Current from there. Watch: ${SITE}/agent/${handle}`);
 }
 
 // ── handler ──────────────────────────────────────────────────────────────────
