@@ -2,6 +2,9 @@
 // npx verigent — one-line onboarding and operations for Verigent.
 //
 //   npx verigent <handle> <vgp_token>    register the Verigent MCP server for your agent
+//   npx verigent continuous <handle> --token <vgp_token>
+//                                        connect + prove the signing key and endpoint, print what the
+//                                        payment and output-channel proofs need (the one setup command)
 //   npx verigent schedule <handle>       install the ~5x/day challenge-pull job (launchd/cron)
 //   npx verigent handler                 run the sovereignty challenge endpoint (HMAC responder)
 //
@@ -10,9 +13,9 @@
 // already holds the token via MCP env. The handler holds its secret only in VG_SECRET env.
 
 import { spawnSync, execSync } from 'node:child_process';
-import { createHmac } from 'node:crypto';
+import { createHmac, generateKeyPairSync, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { createServer } from 'node:http';
-import { writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -54,7 +57,7 @@ const argv = process.argv.slice(2);
 // advertises — while `npx verigent <handle> <vgp_token>` (positional creds, no keyword) stays the
 // paid setup form. Before 2026-09-04 the no-keyword default was 'setup', so bare `npx verigent`
 // fell through to a usage screen instead of actually sitting the test (site⇄CLI drift, Kit cold run).
-const KNOWN_CMDS = ['schedule', 'handler', 'setup', 'free', 'register', 'help'];
+const KNOWN_CMDS = ['schedule', 'handler', 'setup', 'free', 'register', 'help', 'continuous'];
 // Personal COMP CODE (Ant 2026-09-06, VG-115): `npx verigent <code>` — the bare second argument IS the
 // code (their name, e.g. `deshraj`), no flags, no prefix. Shape mirrors COMP_CODE_RE in
 // functions/lib/comp-ladder.ts (this package can't import it; a repo test asserts they match). A single
@@ -101,9 +104,20 @@ Usage:
                                         (--no-schedule to skip the scheduler)
                                         [--harness-version <v>]  declare your build version on every
                                         pull (or set VERIGENT_HARNESS_VERSION); keys the version delta
+  npx verigent continuous <handle> --token <vgp_token>
+                                        the one setup command for continuous verification: connects
+                                        (MCP server + pull job), proves your signing key and — with
+                                        --public-url — your endpoint, then prints what the payment
+                                        proof and the output-channel proof need. Never pays, never
+                                        declares a channel. Re-run any time; proven steps are skipped.
+                                        [--cwd <agent dir>]  where the pull job runs and the key lives
+                                        [--env KEY=VALUE ...]  extra env for the job
+                                        [--public-url <https url>]  the URL reaching 'npx verigent handler'
+                                        [--harness-version <v>]  [--dry-run]
   npx verigent schedule <handle>        install the ~5x/day challenge-pull job (--uninstall to remove)
                                         [--cwd <agent dir>] [--allow <extra,allowed,tools>]
-                                        [--env KEY=VALUE ...]  extra env for the job (e.g. CLAUDE_CONFIG_DIR)
+                                        [--env KEY=VALUE ...]  extra env for the job; CLAUDE_CONFIG_DIR
+                                        is carried over from your shell automatically when set
   npx verigent handler                  run the sovereignty challenge endpoint
                                         [--port 8787]  secret from VG_SECRET env (or --secret)
 
@@ -174,8 +188,9 @@ Full integration notes (including the raw REST contract): ${SITE}/agents.txt`);
   let res = run('claude', addArgs, { stdio: 'pipe' });
   if (res.status !== 0 && `${res.stdout}${res.stderr}`.includes('already exists')) {
     // The free-tier setup registers this server credential-less — replacing it IS the upgrade
-    // path, so remove and re-add rather than failing (Baymax cold run, 2026-07-15).
-    console.log('Verigent server already registered (free tier) — upgrading it with your credentials.');
+    // path, so remove and re-add rather than failing (Baymax cold run, 2026-07-15). A re-run of
+    // the paid setup (e.g. `continuous` twice) lands here too and converges the same way.
+    console.log('Verigent MCP server already registered — replacing it with this handle\'s credentials.');
     run('claude', ['mcp', 'remove', 'verigent', '-s', 'local'], { stdio: 'ignore' });
     res = run('claude', addArgs, { stdio: 'pipe' });
   }
@@ -303,6 +318,14 @@ function cmdSchedule() {
     console.error('Refusing --env entries that look like credentials (TOKEN/SECRET/KEY): the pull token belongs in the MCP server config only (agents.txt §5f).');
     process.exit(1);
   }
+  // CLAUDE_CONFIG_DIR rides along automatically (Kit walk S1 #11, 2026-10-02): an operator on a custom
+  // config dir ran the installer twice and both times the job ran `claude -p` against the DEFAULT
+  // config — logged out, toolless. launchd/cron inherit nothing from the shell, so if the variable is
+  // set when this runs, the job gets it. An explicit --env CLAUDE_CONFIG_DIR=… still wins. It is a
+  // path, not a credential — the §5f rule above is untouched.
+  if (process.env.CLAUDE_CONFIG_DIR && !extraEnv.some(([k]) => k === 'CLAUDE_CONFIG_DIR')) {
+    extraEnv.push(['CLAUDE_CONFIG_DIR', process.env.CLAUDE_CONFIG_DIR]);
+  }
 
   if (process.platform === 'darwin') {
     const dir = join(homedir(), 'Library', 'LaunchAgents');
@@ -354,12 +377,13 @@ function cmdSchedule() {
 `;
     if (dryRun) { console.log(`[dry-run] would write ${plistPath}:\n${plist}`); }
     else {
+      const already = existsSync(plistPath);
       mkdirSync(dir, { recursive: true });
       writeFileSync(plistPath, plist);
       run('launchctl', ['bootout', `gui/${process.getuid()}/${label}`], { stdio: 'ignore' });
       const boot = run('launchctl', ['bootstrap', `gui/${process.getuid()}`, plistPath], { stdio: 'pipe' });
       if (boot.status !== 0) { console.error(`launchctl bootstrap failed: ${boot.stderr}`); process.exit(1); }
-      console.log(`Installed ${label} — every 4h48m (5x/day), working dir ${cwd}.
+      console.log(`${already ? 'Pull job already installed — refreshed' : 'Installed'} ${label} — every 4h48m (5x/day), working dir ${cwd}.
 First pull fires NOW (watch your agent's page — the dots move within minutes).`);
     }
   } else if (process.platform === 'linux') {
@@ -373,7 +397,8 @@ First pull fires NOW (watch your agent's page — the dots move within minutes).
     if (dryRun) { console.log(`[dry-run] crontab entry:\n${flags.uninstall ? '(removed)' : line}`); }
     else {
       execSync('crontab -', { input: next + '\n' });
-      console.log(flags.uninstall ? `Removed ${label} from crontab.` : `Installed ${label} in crontab — 5x/day, working dir ${cwd}.`);
+      const already = current.includes(tag);
+      console.log(flags.uninstall ? `Removed ${label} from crontab.` : `${already ? 'Pull job already installed — refreshed' : 'Installed'} ${label} in crontab — 5x/day, working dir ${cwd}.`);
     }
   } else {
     console.log(`Automatic install isn't supported on ${process.platform} yet. Schedule this 5x/day yourself:\n\n  claude -p "${CYCLE_PROMPT}" --allowedTools "${allowed}"\n\n(run it from ${cwd} — where the MCP server is registered)`);
@@ -489,9 +514,206 @@ Record: ${SITE}/agent/${handle}
 `);
 }
 
+// ── continuous ───────────────────────────────────────────────────────────────
+// THE ONE SETUP COMMAND for continuous verification (Kit walk S1 #6/#12, Ant 2026-10-02: "one short
+// prompt into the agent; what they do with their agent is their business; the agent asks the owner per
+// item"). The owner's report page issues a ~4-line prompt that carries this command; the agent runs it.
+//
+// What it does, in order:
+//   material  POST /api/agent/setup-material {handle, pull_token} — READ-ONLY: the nonce, endpoint secret,
+//             payment address/memo and per-step state the owner's page already issued. 409
+//             setup_not_issued → the page has to issue the setup first; nothing below runs.
+//   connect   exactly cmdSetup: the MCP entry + the ~5x/day pull job (idempotent — a re-run converges).
+//   identity  an Ed25519 keypair at <cwd>/.verigent/<handle>.ed25519.pem (0600, reused if present); signs
+//             the server nonce's UTF-8 bytes; reports public key + signature as raw hex (32 + 64 bytes —
+//             what verifyIdentityProof reads). Skipped when already proven.
+//   endpoint  the HMAC secret to <cwd>/.verigent/<handle>.hmac-secret (0600) for `npx verigent handler`.
+//             With --public-url the URL is reported and Verigent challenges it; without one the step is
+//             left unreported and ONE paragraph says what it needs. Skipped when already proven.
+//   wallet    NEVER done here. The agent gets the exact facts (address, memo, minimum; or Lightning) and
+//   channel   the exact report calls, and is told to ask its owner first. NEVER declared here either.
+//
+// Exit 1 only when the material can't be had (bad token, setup not issued, unreachable). Steps left for
+// the agent are the normal outcome — exit 0. Copy firewall (§2.7): facts and mechanisms, no urgency.
+const SETUP_PROOF_URL = `${SITE}/api/agent/setup-proof`;
+const SETUP_MATERIAL_URL = `${SITE}/api/agent/setup-material`;
+
+async function postJson(url, body) {
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, ok: res.ok, data: data && typeof data === 'object' ? data : {} };
+}
+
+async function cmdContinuous() {
+  const handle = positional.find((a) => !a.startsWith('vgp_'));
+  const token = String(flags.token || positional.find((a) => a.startsWith('vgp_')) || '').trim();
+  if (!handle || !token) {
+    console.error('Usage: npx verigent continuous <handle> --token <vgp_token> [--cwd <agent dir>] [--env KEY=VALUE ...] [--public-url <https url>] [--harness-version <v>] [--dry-run]\n\nBoth values are in the setup prompt on your owner\'s report page.');
+    process.exit(1);
+  }
+  const cwd = flags.cwd || process.cwd();
+  const keyDir = join(cwd, '.verigent');
+  const keyPath = join(keyDir, `${handle}.ed25519.pem`);
+  const secretPath = join(keyDir, `${handle}.hmac-secret`);
+  const publicUrl = String(flags['public-url'] || '').trim();
+  const auth = { handle, pull_token: token };
+  const curl = (body) => `curl -sS -X POST ${SETUP_PROOF_URL} -H 'Content-Type: application/json' -d '${JSON.stringify({ ...auth, ...body })}'`;
+  const rows = []; // [step, result, note]
+  const row = (step, result, note) => rows.push([step, result, note]);
+
+  // ── material (read-only; validates the token before anything is installed) ──
+  let m = null;
+  if (dryRun) {
+    console.log(`[dry-run] POST ${SETUP_MATERIAL_URL} ${JSON.stringify(auth)}`);
+  } else {
+    let r;
+    try { r = await postJson(SETUP_MATERIAL_URL, auth); }
+    catch (e) { console.error(`Couldn't reach ${SITE}: ${e.message}. Try again in a moment.`); process.exit(1); }
+    if (r.status === 409 && r.data.reason === 'setup_not_issued') {
+      console.error(`Setup for ${handle} hasn't been issued yet: your owner opens Set up on the report page (${SITE}/agent/${handle}) first, then this command has the material it needs.`);
+      process.exit(1);
+    }
+    if (!r.ok || !r.data.ok) {
+      console.error(`Couldn't get the setup material: ${r.data.reason || r.data.error || `HTTP ${r.status}`}`);
+      process.exit(1);
+    }
+    m = r.data;
+  }
+  const steps = (m && m.steps && typeof m.steps === 'object') ? m.steps : {};
+  const proven = (s) => steps[s] === 'proven';
+
+  // ── connect (cmdSetup: MCP entry + pull job; idempotent) ──
+  console.log(`\n── connect ──`);
+  positional.length = 0; positional.push(handle, token);
+  cmdSetup();
+  row('connect', dryRun ? 'dry-run' : 'done', m && m.connected ? 'MCP entry + pull job in place; Verigent has already seen checks land' : 'MCP entry + pull job in place; the first check lights this up');
+
+  // ── identity ──
+  console.log(`\n── identity ──`);
+  let privateKey = null, publicHex = '';
+  if (dryRun) {
+    console.log(`[dry-run] ${existsSync(keyPath) ? 'would reuse' : 'would generate'} Ed25519 key ${keyPath} (0600)`);
+    console.log(`[dry-run] POST ${SETUP_PROOF_URL} ${JSON.stringify({ ...auth, step: 'identity', algorithm: 'ed25519', public_key: '<public key hex>', signature: '<signature over the nonce, hex>' })}`);
+    row('identity', 'dry-run', 'would sign the server nonce and report it');
+  } else {
+    if (existsSync(keyPath)) {
+      privateKey = createPrivateKey(readFileSync(keyPath, 'utf8'));
+      console.log(`Signing key: reusing ${keyPath}`);
+    } else {
+      const kp = generateKeyPairSync('ed25519');
+      privateKey = kp.privateKey;
+      mkdirSync(keyDir, { recursive: true, mode: 0o700 });
+      writeFileSync(keyPath, privateKey.export({ format: 'pem', type: 'pkcs8' }), { mode: 0o600 });
+      chmodSync(keyPath, 0o600);
+      console.log(`Signing key: generated ${keyPath} (mode 0600). Keep it — you sign with it again on real runs.`);
+    }
+    publicHex = createPublicKey(privateKey).export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
+    if (proven('identity')) {
+      console.log('Already proven — not reported again (the nonce was used up when it passed).');
+      row('identity', 'proven', 'already proven');
+    } else if (!m.nonce) {
+      console.log('No signing nonce in the material — nothing to sign.');
+      row('identity', 'not reported', 'no nonce issued');
+    } else {
+      const signature = sign(null, Buffer.from(String(m.nonce), 'utf8'), privateKey).toString('hex');
+      let r;
+      try { r = await postJson(SETUP_PROOF_URL, { ...auth, step: 'identity', algorithm: 'ed25519', public_key: publicHex, signature }); }
+      catch (e) { r = { data: { state: 'failed', reason: `couldn't reach ${SITE}: ${e.message}` } }; }
+      const state = r.data.state || (r.ok ? 'proven' : 'failed');
+      console.log(`Reported. Verigent says: ${state} — ${r.data.reason || ''}`.trim());
+      row('identity', state, r.data.reason || '');
+    }
+  }
+
+  // ── endpoint ──
+  console.log(`\n── endpoint ──`);
+  if (dryRun) {
+    console.log(`[dry-run] would write the endpoint secret to ${secretPath} (0600)`);
+    if (publicUrl) console.log(`[dry-run] POST ${SETUP_PROOF_URL} ${JSON.stringify({ ...auth, step: 'endpoint', url: publicUrl })}`);
+    else console.log('[dry-run] no --public-url: would leave the step unreported and print what it needs');
+    row('endpoint', 'dry-run', publicUrl ? `would report ${publicUrl}` : 'no --public-url');
+  } else {
+    if (typeof m.endpoint_secret === 'string' && m.endpoint_secret) {
+      const same = existsSync(secretPath) && readFileSync(secretPath, 'utf8') === m.endpoint_secret;
+      if (!same) {
+        mkdirSync(keyDir, { recursive: true, mode: 0o700 });
+        writeFileSync(secretPath, m.endpoint_secret, { mode: 0o600 });
+        chmodSync(secretPath, 0o600);
+      }
+      console.log(`Endpoint secret: ${same ? 'unchanged at' : 'written to'} ${secretPath} (mode 0600). The handler reads it from there or from VG_SECRET.`);
+    } else {
+      console.log('No endpoint secret in the material.');
+    }
+    if (proven('endpoint')) {
+      console.log('Already proven — not reported again.');
+      row('endpoint', 'proven', 'already proven');
+    } else if (publicUrl) {
+      let r;
+      try { r = await postJson(SETUP_PROOF_URL, { ...auth, step: 'endpoint', url: publicUrl }); }
+      catch (e) { r = { data: { state: 'failed', reason: `couldn't reach ${SITE}: ${e.message}` } }; }
+      const state = r.data.state || (r.ok ? 'proven' : 'failed');
+      console.log(`Reported ${publicUrl}. Verigent says: ${state} — ${r.data.reason || ''}`.trim());
+      row('endpoint', state, r.data.reason || '');
+    } else {
+      console.log(`Not reported. The endpoint proof needs a public HTTPS URL that reaches \`npx verigent handler\` on this machine (it reads the secret from ${secretPath} or from VG_SECRET): a tunnel such as cloudflared, or a host you control. Once there is one, re-run \`npx verigent continuous ${handle} --token <vgp_token> --public-url <url>\` and Verigent challenges it.`);
+      row('endpoint', 'not reported', 'needs a public HTTPS URL — re-run with --public-url');
+    }
+  }
+
+  // ── wallet + channel: facts for the agent to take to its owner. Nothing is paid or declared here. ──
+  console.log(`\n── payment proof (not done by this command) ──`);
+  if (dryRun) {
+    console.log('[dry-run] would print the payment facts from the material (address, memo, minimum; Lightning amount) and the report calls. No payment is ever made here.');
+    row('wallet', 'dry-run', 'for the agent');
+  } else if (proven('wallet')) {
+    console.log('Already proven.');
+    row('wallet', 'proven', 'already proven');
+  } else {
+    const sol = m.sol && typeof m.sol === 'object' ? m.sol : null;
+    const sats = Number(m.lightning_sats || 0);
+    console.log('A payment from a wallet this agent controls is the proof. Ask your owner before making it.');
+    if (sol && sol.address) {
+      console.log(`Solana: send at least ${sol.min_lamports} lamports to ${sol.address} with the memo ${sol.memo} (the memo is required — it binds the payment to this agent), then report the transaction signature:`);
+      console.log(`  ${curl({ step: 'wallet', rail: 'sol', signature: '<transaction signature>' })}`);
+      console.log('If the reply says the transaction isn\'t indexed yet, wait about 20 seconds and report it again.');
+    }
+    if (sats > 0) {
+      console.log(`Or Lightning (${sats} sats): report once to receive an invoice, pay it, then send the same report again:`);
+      console.log(`  ${curl({ step: 'wallet', rail: 'lightning' })}`);
+    }
+    console.log('Standing permission: continuous verification may ask for a payment this small again. Only pay within a cap your owner sets — ask your owner for one.');
+    row('wallet', 'for the agent', 'ask your owner before paying — see above');
+  }
+
+  console.log(`\n── output channel (not done by this command) ──`);
+  if (dryRun) {
+    console.log('[dry-run] would print the channel report calls. No channel is ever declared here.');
+    row('channel', 'dry-run', 'for the agent');
+  } else if (proven('channel')) {
+    console.log('Already proven.');
+    row('channel', 'proven', 'already proven');
+  } else {
+    if (steps.channel === 'declared') console.log('Declared already. If Verigent emailed a code to that address, report it to prove the channel:');
+    else {
+      console.log('Ask your owner which output channel to declare, then report it:');
+      console.log(`  ${curl({ step: 'channel', channel: 'email you@example.com' })}`);
+      console.log('For an email address, Verigent sends a code to it. Report the code back to prove the channel:');
+    }
+    console.log(`  ${curl({ step: 'channel', code: '<code from the email>' })}`);
+    console.log('Other channels are recorded as declared; the first check that writes to them confirms them.');
+    row('channel', steps.channel === 'declared' ? 'declared' : 'for the agent', 'ask your owner which channel — see above');
+  }
+
+  // ── summary ──
+  const w = [Math.max(...rows.map((r) => r[0].length), 4), Math.max(...rows.map((r) => r[1].length), 6)];
+  const line = (a, b, c) => `  ${a.padEnd(w[0])}  ${b.padEnd(w[1])}  ${c}`;
+  console.log(`\n── summary ──\n${line('step', 'result', 'note')}\n${rows.map((r) => line(...r)).join('\n')}\n\nSend the pull token only to ${SITE}. Record: ${(m && typeof m.page_url === "string" && m.page_url.startsWith(SITE)) ? m.page_url : `${SITE}/agent/${handle}`} — each proof lights up there as it lands.\n`);
+}
+
 if (cmd === 'help' || argv.includes('--help')) usage();
 else if (cmd === 'schedule') cmdSchedule();
 else if (cmd === 'handler') cmdHandler();
 else if (cmd === 'free') await cmdFree();
 else if (cmd === 'register') cmdRegister();
+else if (cmd === 'continuous') await cmdContinuous();
 else cmdSetup();
