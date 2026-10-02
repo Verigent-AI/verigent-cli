@@ -5,21 +5,29 @@
 //   npx verigent continuous <handle> --token <vgp_token>
 //                                        connect + prove the signing key and endpoint, print what the
 //                                        payment and output-channel proofs need (the one setup command)
+//   npx verigent prove endpoint          prove the endpoint: the handler as a persistent job (+ a cloudflared
+//                                        quick tunnel when no --public-url), then report the URL
+//   npx verigent prove wallet --rail …   the exact payment to make (never pays), then report it (--tx / 2nd run)
+//   npx verigent prove channel --email … declare the output channel; --code reports the emailed code back
 //   npx verigent schedule <handle>       install the ~5x/day challenge-pull job (launchd/cron)
 //   npx verigent handler                 run the sovereignty challenge endpoint (HMAC responder)
 //
-// Design constraints (agents.txt §5f): the pull token lives ONLY in the MCP server config —
-// the scheduler this installs contains NO credentials; it just wakes the agent, whose harness
-// already holds the token via MCP env. The handler holds its secret only in VG_SECRET env.
+// Design constraints (agents.txt §5f): the pull token lives ONLY in the MCP server config and in
+// <cwd>/.verigent/<handle>.json (0600, written by `continuous`, read by `prove`) — the jobs this
+// installs contain NO credentials; the pull job just wakes the agent, whose harness already holds the
+// token via MCP env, and the handler job reads its secret from a 0600 file named by VG_SECRET_FILE.
 
-import { spawnSync, execSync } from 'node:child_process';
+import { spawnSync, spawn, execSync } from 'node:child_process';
 import { createHmac, generateKeyPairSync, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { createServer } from 'node:http';
-import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, chmodSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, chmodSync, readdirSync, openSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const SITE = 'https://verigent.ai';
+// This package's own version (package.json ships in every npm tarball). The handler job pins
+// `npx -y verigent@<this>` so what the owner audited is what keeps running after a reboot.
+const PKG_VERSION = (() => { try { return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version; } catch { return 'latest'; } })();
 // PINNED MCP server version (B7, Greg #6): an unpinned `npx -y verigent-mcp-server` re-pulls latest
 // every run, so what a customer audits today isn't what runs next week. Pin to an exact version for
 // reproducibility. UPGRADE PATH: publish the new verigent-mcp-server, then bump this one constant —
@@ -57,7 +65,7 @@ const argv = process.argv.slice(2);
 // advertises — while `npx verigent <handle> <vgp_token>` (positional creds, no keyword) stays the
 // paid setup form. Before 2026-09-04 the no-keyword default was 'setup', so bare `npx verigent`
 // fell through to a usage screen instead of actually sitting the test (site⇄CLI drift, Kit cold run).
-const KNOWN_CMDS = ['schedule', 'handler', 'setup', 'free', 'register', 'help', 'continuous'];
+const KNOWN_CMDS = ['schedule', 'handler', 'setup', 'free', 'register', 'help', 'prove', 'continuous'];
 // Personal COMP CODE (Ant 2026-09-06, VG-115): `npx verigent <code>` — the bare second argument IS the
 // code (their name, e.g. `deshraj`), no flags, no prefix. Shape mirrors COMP_CODE_RE in
 // functions/lib/comp-ladder.ts (this package can't import it; a repo test asserts they match). A single
@@ -114,6 +122,21 @@ Usage:
                                         [--env KEY=VALUE ...]  extra env for the job
                                         [--public-url <https url>]  the URL reaching 'npx verigent handler'
                                         [--harness-version <v>]  [--dry-run]
+  npx verigent prove endpoint           prove the endpoint: installs 'npx verigent handler' as a
+                                        persistent job (ai.verigent.handler.<handle>) and reports its
+                                        public URL. Without --public-url it opens a cloudflared quick
+                                        tunnel when cloudflared is on PATH (that URL changes whenever
+                                        the job restarts — re-run this to re-report it)
+                                        [--public-url <https url>] [--port 8787] [--cwd <agent dir>]
+  npx verigent prove wallet --rail sol|lightning [--cap "<text>"] [--tx <signature>]
+                                        prove the payment: first prints the exact payment to make
+                                        (never pays); then --tx <signature> (Solana) or a second run
+                                        (Lightning) reports it
+  npx verigent prove channel --email <address> | --channel "<text>" | --code <code>
+                                        declare the output channel (email: a code is sent there);
+                                        --code reports the code back to prove it
+                                        prove reads <cwd>/.verigent/<handle>.json (written by
+                                        'continuous'); --handle <h> / --token <t> override it
   npx verigent schedule <handle>        install the ~5x/day challenge-pull job (--uninstall to remove)
                                         [--cwd <agent dir>] [--allow <extra,allowed,tools>]
                                         [--env KEY=VALUE ...]  extra env for the job; CLAUDE_CONFIG_DIR
@@ -129,6 +152,43 @@ Your handle and vgp_ token are in your welcome email. Docs: ${SITE}/agents.txt
 const isWin = process.platform === 'win32';
 const run = (bin, args, opts = {}) => spawnSync(bin, args, { shell: isWin, ...opts });
 const haveClaude = () => { const p = run('claude', ['--version'], { stdio: 'ignore' }); return !p.error && p.status === 0; };
+/** Absolute path of a binary on PATH, or null. */
+const which = (bin) => {
+  try { return execSync(isWin ? `where ${bin}` : `command -v ${bin}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n')[0] || null; }
+  catch { return null; }
+};
+const jobLabel = (kind, handle) => `ai.verigent.${kind}.${handle.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** Poll `fn` every `every` ms for up to `ms`; the first truthy value, else null. */
+async function waitFor(fn, ms, every = 500) {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() >= end) return null;
+    await sleep(every);
+  }
+}
+
+// ── guidance the agent is given, word for word ──────────────────────────────
+// ONE wording, two printers: functions/lib/setup-prompt.ts (the owner's board) prints the same
+// sentences; tests/one-setup-prompt.test.mjs pins them against THIS file. Reword here and there together.
+const WALLET_PROOF_LINE = 'A payment from a wallet this agent controls is the proof.';
+const solMechanics = (sol) => `Solana: send at least ${sol.min_lamports} lamports to ${sol.address} with the memo ${sol.memo} (the memo is required — it binds the payment to this agent), then report the transaction signature:`;
+const SOL_INDEX_LAG = "If the reply says the transaction isn't indexed yet, wait about 20 seconds and report it again.";
+const lightningMechanics = (sats) => `Lightning (${sats} sats): report once to receive an invoice, pay it, then send the same report again:`;
+const STANDING_PERMISSION = 'Standing permission: continuous verification may ask for a payment this small again.';
+const CAP_FROM_OWNER = 'Only pay within a cap your owner sets — ask your owner for one.';
+const CHANNEL_ASK = 'Ask your owner which output channel to declare, then report it:';
+const CHANNEL_CODE_LINE = 'For an email address, Verigent sends a code to it. Report the code back to prove the channel:';
+const CHANNEL_OTHER = 'Other channels are recorded as declared; the first check that writes to them confirms them.';
+// The ONE-LINE commands the owner's board hands the agent per step (Kit walk 2 #28). The board emits
+// exactly these strings; keep them in step.
+const PROVE_ENDPOINT_CMD = 'npx verigent prove endpoint';
+const PROVE_WALLET_SOL_CMD = 'npx verigent prove wallet --rail sol';
+const PROVE_WALLET_LN_CMD = 'npx verigent prove wallet --rail lightning';
+const PROVE_CHANNEL_CMD = 'npx verigent prove channel --email <address>';
+const PROVE_CODE_CMD = 'npx verigent prove channel --code <code from the email>';
 
 // ── setup ────────────────────────────────────────────────────────────────────
 function cmdSetup() {
@@ -305,7 +365,7 @@ Next:
 function cmdSchedule() {
   const handle = positional[0];
   if (!handle) { console.error('Usage: npx verigent schedule <handle> [--cwd <agent dir>] [--uninstall]'); process.exit(1); }
-  const label = `ai.verigent.pull.${handle.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`;
+  const label = jobLabel('pull', handle);
   const cwd = flags.cwd || process.cwd();
   const allowed = ['mcp__verigent'].concat(flags.allow ? flags.allow.split(',') : []).join(',');
   // Extra env for the job (launchd inherits nothing from your shell). Values are env NAMES and
@@ -416,15 +476,27 @@ Testing starts at the agent's first check; the report reads Current from there. 
 // ── handler ──────────────────────────────────────────────────────────────────
 // The sovereignty (infrastructure-independence) challenge endpoint, exactly per the public
 // contract: POST {challenge} → 200 {proof: HMAC-SHA256(secret, challenge) lowercase hex,
-// timestamp: ISO}. Zero dependencies; the secret only ever comes from env/flag.
+// timestamp: ISO}. Zero dependencies; the secret only ever comes from env/flag/a 0600 file —
+// --secret · VG_SECRET · --secret-file / VG_SECRET_FILE (what `prove endpoint`'s job sets) · or the one
+// <cwd>/.verigent/<handle>.hmac-secret that `continuous` wrote, when there is exactly one.
+function handlerSecret() {
+  if (flags.secret) return { secret: String(flags.secret), from: '--secret' };
+  if (process.env.VG_SECRET) return { secret: process.env.VG_SECRET, from: 'VG_SECRET env' };
+  const file = flags['secret-file'] || process.env.VG_SECRET_FILE;
+  if (file && existsSync(file)) return { secret: readFileSync(file, 'utf8').trim(), from: file };
+  const dir = join(process.cwd(), '.verigent');
+  const found = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.hmac-secret')) : [];
+  if (found.length === 1) return { secret: readFileSync(join(dir, found[0]), 'utf8').trim(), from: join(dir, found[0]) };
+  return { secret: '', from: null };
+}
 function cmdHandler() {
-  const secret = flags.secret || process.env.VG_SECRET;
+  const { secret, from } = handlerSecret();
   const port = parseInt(flags.port || '8787', 10);
   if (!secret) {
-    console.error('Set the per-run secret first: VG_SECRET=<secret> npx verigent handler  (or --secret <secret>)');
+    console.error('Set the per-run secret first: VG_SECRET=<secret> npx verigent handler  (or --secret <secret>, or VG_SECRET_FILE=<path> / --secret-file <path>)');
     process.exit(1);
   }
-  if (dryRun) { console.log(`[dry-run] would listen on :${port}, HMAC-SHA256 responder, secret from ${flags.secret ? '--secret' : 'VG_SECRET env'}`); return; }
+  if (dryRun) { console.log(`[dry-run] would listen on :${port}, HMAC-SHA256 responder, secret from ${from}`); return; }
   const server = createServer((req, res) => {
     if (req.method !== 'POST') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -451,8 +523,8 @@ function cmdHandler() {
 Contract: POST {"challenge":"<32-hex>"} → {"proof":"<hmac-sha256 hex>","timestamp":"<ISO>"}
 
 Expose it at a public HTTPS URL you control (a Worker, VPS, tunnel — hosting it
-yourself IS the infrastructure-independence proof), then save that URL in Owner
-Controls → Sovereignty testing. Docs: ${SITE}/agents.txt`);
+yourself IS the infrastructure-independence proof), then report that URL:
+  ${PROVE_ENDPOINT_CMD} --public-url <url>      Docs: ${SITE}/agents.txt`);
   });
 }
 
@@ -544,6 +616,35 @@ async function postJson(url, body) {
   return { status: res.status, ok: res.ok, data: data && typeof data === 'object' ? data : {} };
 }
 
+/** POST setup-material (read-only). Exits 1 — one plain line — when it can't be had. Shared by
+ *  `continuous` and `prove`. */
+async function fetchMaterial(site, handle, token) {
+  const auth = { handle, pull_token: token };
+  let r;
+  try { r = await postJson(`${site}/api/agent/setup-material`, auth); }
+  catch (e) { console.error(`Couldn't reach ${site}: ${e.message}. Try again in a moment.`); process.exit(1); }
+  if (r.status === 409 && r.data.reason === 'setup_not_issued') {
+    console.error(`Setup for ${handle} hasn't been issued yet: your owner opens Set up on the report page (${site}/agent/${handle}) first, then this command has the material it needs.`);
+    process.exit(1);
+  }
+  if (!r.ok || !r.data.ok) {
+    console.error(`Couldn't get the setup material: ${r.data.reason || r.data.error || `HTTP ${r.status}`}`);
+    process.exit(1);
+  }
+  return r.data;
+}
+
+// The handle file (Kit walk 2 #28): `continuous` persists it once material + connect succeed; every
+// `prove` command reads it so the owner's per-step command is ONE line with no credentials in it.
+const handleFilePath = (cwd, handle) => join(cwd, '.verigent', `${handle}.json`);
+function saveHandleFile(cwd, handle, token) {
+  const p = handleFilePath(cwd, handle);
+  mkdirSync(join(cwd, '.verigent'), { recursive: true, mode: 0o700 });
+  writeFileSync(p, JSON.stringify({ handle, pull_token: token, site: SITE }, null, 2) + '\n', { mode: 0o600 });
+  chmodSync(p, 0o600);
+  return p;
+}
+
 async function cmdContinuous() {
   const handle = positional.find((a) => !a.startsWith('vgp_'));
   const token = String(flags.token || positional.find((a) => a.startsWith('vgp_')) || '').trim();
@@ -563,22 +664,8 @@ async function cmdContinuous() {
 
   // ── material (read-only; validates the token before anything is installed) ──
   let m = null;
-  if (dryRun) {
-    console.log(`[dry-run] POST ${SETUP_MATERIAL_URL} ${JSON.stringify(auth)}`);
-  } else {
-    let r;
-    try { r = await postJson(SETUP_MATERIAL_URL, auth); }
-    catch (e) { console.error(`Couldn't reach ${SITE}: ${e.message}. Try again in a moment.`); process.exit(1); }
-    if (r.status === 409 && r.data.reason === 'setup_not_issued') {
-      console.error(`Setup for ${handle} hasn't been issued yet: your owner opens Set up on the report page (${SITE}/agent/${handle}) first, then this command has the material it needs.`);
-      process.exit(1);
-    }
-    if (!r.ok || !r.data.ok) {
-      console.error(`Couldn't get the setup material: ${r.data.reason || r.data.error || `HTTP ${r.status}`}`);
-      process.exit(1);
-    }
-    m = r.data;
-  }
+  if (dryRun) console.log(`[dry-run] POST ${SETUP_MATERIAL_URL} ${JSON.stringify(auth)}`);
+  else m = await fetchMaterial(SITE, handle, token);
   const steps = (m && m.steps && typeof m.steps === 'object') ? m.steps : {};
   const proven = (s) => steps[s] === 'proven';
 
@@ -587,6 +674,9 @@ async function cmdContinuous() {
   positional.length = 0; positional.push(handle, token);
   cmdSetup();
   row('connect', dryRun ? 'dry-run' : 'done', m && m.connected ? 'MCP entry + pull job in place; Verigent has already seen checks land' : 'MCP entry + pull job in place; the first check lights this up');
+  // The handle file: what every `prove` command reads (the token is never printed).
+  if (dryRun) console.log(`[dry-run] would save ${handleFilePath(cwd, handle)} (0600) — handle, pull token, site — for the prove commands`);
+  else console.log(`Saved ${saveHandleFile(cwd, handle, token)} (mode 0600) — the prove commands read the handle and pull token from it.`);
 
   // ── identity ──
   console.log(`\n── identity ──`);
@@ -655,8 +745,8 @@ async function cmdContinuous() {
       console.log(`Reported ${publicUrl}. Verigent says: ${state} — ${r.data.reason || ''}`.trim());
       row('endpoint', state, r.data.reason || '');
     } else {
-      console.log(`Not reported. The endpoint proof needs a public HTTPS URL that reaches \`npx verigent handler\` on this machine (it reads the secret from ${secretPath} or from VG_SECRET): a tunnel such as cloudflared, or a host you control. Once there is one, re-run \`npx verigent continuous ${handle} --token <vgp_token> --public-url <url>\` and Verigent challenges it.`);
-      row('endpoint', 'not reported', 'needs a public HTTPS URL — re-run with --public-url');
+      console.log(`Not reported. The endpoint proof needs a public HTTPS URL that reaches \`npx verigent handler\` on this machine (it reads the secret from ${secretPath} or from VG_SECRET): a tunnel such as cloudflared, or a host you control. Once there is one, re-run \`npx verigent continuous ${handle} --token <vgp_token> --public-url <url>\` and Verigent challenges it. Or run \`${PROVE_ENDPOINT_CMD}\`: it installs the handler as a persistent job and, with cloudflared on PATH, opens a quick tunnel and reports the URL itself.`);
+      row('endpoint', 'not reported', `needs a public HTTPS URL — ${PROVE_ENDPOINT_CMD}`);
     }
   }
 
@@ -671,17 +761,18 @@ async function cmdContinuous() {
   } else {
     const sol = m.sol && typeof m.sol === 'object' ? m.sol : null;
     const sats = Number(m.lightning_sats || 0);
-    console.log('A payment from a wallet this agent controls is the proof. Ask your owner before making it.');
+    console.log(`${WALLET_PROOF_LINE} Ask your owner before making it.`);
     if (sol && sol.address) {
-      console.log(`Solana: send at least ${sol.min_lamports} lamports to ${sol.address} with the memo ${sol.memo} (the memo is required — it binds the payment to this agent), then report the transaction signature:`);
+      console.log(solMechanics(sol));
       console.log(`  ${curl({ step: 'wallet', rail: 'sol', signature: '<transaction signature>' })}`);
-      console.log('If the reply says the transaction isn\'t indexed yet, wait about 20 seconds and report it again.');
+      console.log(SOL_INDEX_LAG);
     }
     if (sats > 0) {
-      console.log(`Or Lightning (${sats} sats): report once to receive an invoice, pay it, then send the same report again:`);
+      console.log(`Or ${lightningMechanics(sats)}`);
       console.log(`  ${curl({ step: 'wallet', rail: 'lightning' })}`);
     }
-    console.log('Standing permission: continuous verification may ask for a payment this small again. Only pay within a cap your owner sets — ask your owner for one.');
+    console.log(`${STANDING_PERMISSION} ${CAP_FROM_OWNER}`);
+    console.log(`Or let the CLI carry the report:  ${PROVE_WALLET_SOL_CMD} --tx <signature>   ·   ${PROVE_WALLET_LN_CMD}`);
     row('wallet', 'for the agent', 'ask your owner before paying — see above');
   }
 
@@ -695,12 +786,13 @@ async function cmdContinuous() {
   } else {
     if (steps.channel === 'declared') console.log('Declared already. If Verigent emailed a code to that address, report it to prove the channel:');
     else {
-      console.log('Ask your owner which output channel to declare, then report it:');
+      console.log(CHANNEL_ASK);
       console.log(`  ${curl({ step: 'channel', channel: 'email you@example.com' })}`);
-      console.log('For an email address, Verigent sends a code to it. Report the code back to prove the channel:');
+      console.log(CHANNEL_CODE_LINE);
     }
     console.log(`  ${curl({ step: 'channel', code: '<code from the email>' })}`);
-    console.log('Other channels are recorded as declared; the first check that writes to them confirms them.');
+    console.log(CHANNEL_OTHER);
+    console.log(`Or let the CLI carry the report:  ${PROVE_CHANNEL_CMD}   ·   ${PROVE_CODE_CMD}`);
     row('channel', steps.channel === 'declared' ? 'declared' : 'for the agent', 'ask your owner which channel — see above');
   }
 
@@ -710,10 +802,276 @@ async function cmdContinuous() {
   console.log(`\n── summary ──\n${line('step', 'result', 'note')}\n${rows.map((r) => line(...r)).join('\n')}\n\nSend the pull token only to ${SITE}. Record: ${(m && typeof m.page_url === "string" && m.page_url.startsWith(SITE)) ? m.page_url : `${SITE}/agent/${handle}`} — each proof lights up there as it lands.\n`);
 }
 
+// ── prove ────────────────────────────────────────────────────────────────────
+// ONE COMMAND PER STEP (Kit walk 2 #28, Ant 2026-10-03: the per-step prompt box was "a wall — too much
+// work to read"). The owner's board hands the agent exactly one line per pending step; the CLI carries the
+// explanation and does the work. Credentials come from the handle file `continuous` saved (never from the
+// pasted line); --handle / --token override it. Every result line is the SERVER's reason — nothing here is
+// taken as done. Exit 0 on proven / declared / instructions printed; exit 1 on auth, material or usage.
+//
+//   prove endpoint   the handler as a persistent job (launchd / crontab @reboot) — label
+//                    ai.verigent.handler.<handle>, secret via VG_SECRET_FILE — and, without --public-url, a
+//                    cloudflared quick tunnel in the SAME job; then POST {step:"endpoint", url}.
+//   prove wallet     never pays. Phase 1 prints the exact payment (Solana: address, memo, minimum; Lightning:
+//                    the invoice minted by the first report); phase 2 (--tx, or the second Lightning run)
+//                    reports it.
+//   prove channel    --email / --channel declares (an email address gets a code sent to it); --code reports
+//                    the code back.
+const PROVE_USAGE = `Usage:
+  ${PROVE_ENDPOINT_CMD} [--public-url <https url>] [--port 8787] [--cwd <agent dir>]
+  ${PROVE_WALLET_SOL_CMD} | ${PROVE_WALLET_LN_CMD}  [--cap "<text>"] [--tx <signature>]
+  ${PROVE_CHANNEL_CMD} | --channel "<text>" | --code <code>
+Reads <cwd>/.verigent/<handle>.json (written by \`npx verigent continuous\`); --handle <h> --token <vgp_token> override it.`;
+
+/** Which agent: --handle/--token, else the one handle file under <cwd>/.verigent (several → refuse). */
+function resolveProveContext() {
+  const cwd = flags.cwd || process.cwd();
+  const dir = join(cwd, '.verigent');
+  let handle = String(flags.handle || '').trim();
+  let token = String(flags.token || '').trim();
+  if (handle && token) return { handle, token, site: SITE, cwd, file: null };
+  if (!handle) {
+    const handles = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)).sort() : [];
+    if (handles.length === 0) {
+      console.error(`No handle file in ${dir}: run \`npx verigent continuous <handle> --token <vgp_token>\` first (it saves one), or pass --handle <handle> --token <vgp_token>.`);
+      process.exit(1);
+    }
+    if (handles.length > 1) {
+      console.error(`Several handle files in ${dir} — say which: ${handles.map((h) => `--handle ${h}`).join('  or  ')}`);
+      process.exit(1);
+    }
+    handle = handles[0];
+  }
+  const file = handleFilePath(cwd, handle);
+  if (!existsSync(file)) {
+    console.error(`No handle file for ${handle} at ${file}: run \`npx verigent continuous ${handle} --token <vgp_token>\` first, or pass --token <vgp_token> as well.`);
+    process.exit(1);
+  }
+  let j;
+  try { j = JSON.parse(readFileSync(file, 'utf8')); } catch { console.error(`Couldn't read ${file} — not JSON. Re-run \`npx verigent continuous ${handle} --token <vgp_token>\` to rewrite it.`); process.exit(1); }
+  token = token || String((j && j.pull_token) || '').trim();
+  if (!token) { console.error(`${file} has no pull_token. Re-run \`npx verigent continuous ${handle} --token <vgp_token>\` to rewrite it, or pass --token.`); process.exit(1); }
+  const site = j && typeof j.site === 'string' && /^https:\/\/[^/\s]+$/.test(j.site.replace(/\/$/, '')) ? j.site.replace(/\/$/, '') : SITE;
+  return { handle: String((j && j.handle) || handle), token, site, cwd, file };
+}
+
+/** POST setup-proof for this agent. Exit 1 on an unreachable site. Returns { status, ok, data }. */
+async function proveReport(ctx, body) {
+  try { return await postJson(`${ctx.site}/api/agent/setup-proof`, { handle: ctx.handle, pull_token: ctx.token, ...body }); }
+  catch (e) { console.error(`Couldn't reach ${ctx.site}: ${e.message}. Try again in a moment.`); process.exit(1); }
+}
+const resultLine = (r) => `${r.data.state || (r.ok ? 'proven' : 'failed')} — ${r.data.reason || `HTTP ${r.status}`}`;
+const recordLine = (ctx) => `Record: ${ctx.site}/agent/${ctx.handle}`;
+/** Print the server's one-line result + the record link; exit 0 for a result (proven / declared / failed
+ *  verification = 200), 1 for auth / usage / budget (anything else). */
+function finishProve(ctx, r, extraLines = []) {
+  console.log(resultLine(r));
+  for (const l of extraLines) console.log(l);
+  console.log(recordLine(ctx));
+  process.exit(r.status === 200 ? 0 : 1);
+}
+
+// ── prove endpoint ──
+const handlerUp = async (port) => {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) });
+    return res.ok && /verigent handler up/.test(await res.text());
+  } catch { return false; }
+};
+const tunnelUrl = (logPath) => {
+  if (!existsSync(logPath)) return null;
+  const m = readFileSync(logPath, 'utf8').match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/g);
+  return m ? m[m.length - 1] : null;
+};
+const WAIT_MS = 60000;
+
+/** Install (or replace) the persistent handler job: a readable shell script under <cwd>/.verigent, run by
+ *  launchd (macOS, KeepAlive) or started now + `@reboot` in crontab (elsewhere). The script holds no
+ *  credentials — the handler reads its secret from the 0600 file VG_SECRET_FILE names. */
+function installHandlerJob({ handle, cwd, port, withTunnel, cloudflaredBin, secretPath, scriptPath, logPath }) {
+  const label = jobLabel('handler', handle);
+  const npxDir = (which('npx') || '/usr/local/bin/npx').replace(/\/[^/]+$/, '');
+  const dirs = [npxDir, cloudflaredBin ? cloudflaredBin.replace(/\/[^/]+$/, '') : null, '/usr/local/bin', '/opt/homebrew/bin', '/usr/bin', '/bin'].filter(Boolean);
+  const pathEnv = [...new Set(dirs)].join(':');
+  const handlerCmd = `npx -y verigent@${PKG_VERSION} handler --port ${port}`;
+  const script = `#!/bin/sh
+# Installed by \`${PROVE_ENDPOINT_CMD}\` for ${handle} (job ${label}).
+# Runs the Verigent challenge handler on :${port}${withTunnel ? ' behind a cloudflared quick tunnel' : ''}.
+# No credentials in here: the handler reads its HMAC secret from the 0600 file VG_SECRET_FILE names.
+export PATH="${pathEnv}"
+export VG_SECRET_FILE="${secretPath}"
+cd "${cwd}" || exit 1
+${withTunnel ? `${handlerCmd} &
+HANDLER=$!
+trap 'kill $HANDLER 2>/dev/null' EXIT INT TERM
+cloudflared tunnel --no-autoupdate --url http://localhost:${port}` : `exec ${handlerCmd}`}
+`;
+  mkdirSync(join(cwd, '.verigent'), { recursive: true, mode: 0o700 });
+  writeFileSync(scriptPath, script, { mode: 0o700 });
+  chmodSync(scriptPath, 0o700);
+  writeFileSync(logPath, ''); // a fresh log: the tunnel URL we read back is this run's, never a stale one
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  if (process.platform === 'darwin') {
+    const dir = join(homedir(), 'Library', 'LaunchAgents');
+    const plistPath = join(dir, `${label}.plist`);
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${label}</string>
+  <!-- Installed by \`${PROVE_ENDPOINT_CMD}\`. Contains NO credentials by design: the handler reads
+       its secret from the 0600 file named in the script (verigent.ai/agents.txt §5f). -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>${esc(scriptPath)}</string>
+  </array>
+  <key>WorkingDirectory</key><string>${esc(cwd)}</string>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>${esc(logPath)}</string>
+  <key>StandardErrorPath</key><string>${esc(logPath)}</string>
+</dict>
+</plist>
+`;
+    const already = existsSync(plistPath);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(plistPath, plist);
+    run('launchctl', ['bootout', `gui/${process.getuid()}/${label}`], { stdio: 'ignore' });
+    const boot = run('launchctl', ['bootstrap', `gui/${process.getuid()}`, plistPath], { stdio: 'pipe' });
+    if (boot.status !== 0) { console.error(`launchctl bootstrap failed: ${boot.stderr}`); process.exit(1); }
+    console.log(`${already ? 'Handler job already installed — replaced' : 'Installed'} ${label} (launchd, kept alive across reboots): ${scriptPath}. Log: ${logPath}`);
+  } else if (process.platform === 'linux') {
+    const tag = `# ${label}`;
+    const line = `@reboot /bin/sh ${JSON.stringify(scriptPath)} >> ${JSON.stringify(logPath)} 2>&1 ${tag}`;
+    const current = (() => { try { return execSync('crontab -l', { encoding: 'utf8' }); } catch { return ''; } })();
+    const cleaned = current.split('\n').filter((l) => !l.includes(tag)).join('\n').replace(/\n+$/, '');
+    execSync('crontab -', { input: `${cleaned}\n${line}\n` });
+    // cron only fires @reboot — start it now, detached, writing the same log.
+    const fd = openSync(logPath, 'a');
+    spawn('/bin/sh', [scriptPath], { cwd, detached: true, stdio: ['ignore', fd, fd] }).unref();
+    closeSync(fd);
+    console.log(`${current.includes(tag) ? 'Handler job already installed — replaced' : 'Installed'} ${label} (crontab @reboot) and started it now: ${scriptPath}. Log: ${logPath}`);
+  } else {
+    console.error(`Automatic install isn't supported on ${process.platform} yet. Run the handler yourself and report its public URL:\n\n  VG_SECRET_FILE=${secretPath} ${handlerCmd}\n  ${PROVE_ENDPOINT_CMD} --public-url <url>`);
+    process.exit(1);
+  }
+}
+
+async function proveEndpoint(ctx) {
+  const port = parseInt(flags.port || '8787', 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) { console.error('--port must be a number from 1 to 65535.'); process.exit(1); }
+  const publicUrl = String(flags['public-url'] || '').trim();
+  if (publicUrl && !/^https:\/\//.test(publicUrl)) { console.error('--public-url must start with https://'); process.exit(1); }
+  const dir = join(ctx.cwd, '.verigent');
+  const secretPath = join(dir, `${ctx.handle}.hmac-secret`);
+  const scriptPath = join(dir, `${ctx.handle}.handler.sh`);
+  const logPath = join(dir, `${ctx.handle}.handler.log`);
+
+  let up = await handlerUp(port);
+  let url = publicUrl || (up ? tunnelUrl(logPath) : null);
+  const needTunnel = !publicUrl && !url;
+  const cloudflaredBin = needTunnel ? which('cloudflared') : null;
+  if (needTunnel && !cloudflaredBin) {
+    // ONE sentence, nothing installed (#28).
+    console.error(`Needs a public URL: install cloudflared (brew install cloudflared, or https://github.com/cloudflare/cloudflared/releases) and re-run \`${PROVE_ENDPOINT_CMD}\` to open a quick tunnel, or re-run it with --public-url <url> if a tunnel or host already reaches port ${port} on this machine.`);
+    process.exit(1);
+  }
+  if (!up || needTunnel) {
+    if (!existsSync(secretPath)) {
+      const m = await fetchMaterial(ctx.site, ctx.handle, ctx.token);
+      if (typeof m.endpoint_secret !== 'string' || !m.endpoint_secret) { console.error('No endpoint secret in the setup material — your owner re-issues the setup from the report page.'); process.exit(1); }
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writeFileSync(secretPath, m.endpoint_secret, { mode: 0o600 });
+      chmodSync(secretPath, 0o600);
+      console.log(`Endpoint secret: written to ${secretPath} (mode 0600).`);
+    }
+    installHandlerJob({ handle: ctx.handle, cwd: ctx.cwd, port, withTunnel: needTunnel, cloudflaredBin, secretPath, scriptPath, logPath });
+    up = await waitFor(() => handlerUp(port), WAIT_MS);
+    if (!up) { console.error(`The handler didn't answer on :${port} within ${WAIT_MS / 1000} s — see ${logPath}.`); process.exit(1); }
+    if (needTunnel) {
+      url = await waitFor(() => tunnelUrl(logPath), WAIT_MS);
+      if (!url) { console.error(`cloudflared didn't report a trycloudflare.com URL within ${WAIT_MS / 1000} s — see ${logPath}.`); process.exit(1); }
+      console.log(`Quick tunnel: ${url} (this URL changes whenever the job restarts — re-run \`${PROVE_ENDPOINT_CMD}\` to re-report it).`);
+    }
+  } else {
+    console.log(`Handler already up on :${port}${publicUrl ? '' : ` behind ${url}`} — left running.`);
+  }
+  console.log(`Reporting ${url} …`);
+  finishProve(ctx, await proveReport(ctx, { step: 'endpoint', url }));
+}
+
+// ── prove wallet ──
+async function proveWallet(ctx) {
+  const rail = String(flags.rail || '').trim().toLowerCase();
+  if (rail !== 'sol' && rail !== 'lightning') { console.error(`Which rail? ${PROVE_WALLET_SOL_CMD}  or  ${PROVE_WALLET_LN_CMD}  [--cap "<text>"] [--tx <signature>]`); process.exit(1); }
+  const cap = String(flags.cap || '').trim();
+  const tx = String(flags.tx || '').trim();
+  const railName = rail === 'sol' ? 'Solana' : 'Lightning';
+  // The owner's approval leads (the same sentences the board prints); the cap IS the standing permission.
+  const lead = cap
+    ? `Your owner approves ONE payment of up to ${cap} on ${railName}. ${WALLET_PROOF_LINE}`
+    : `Your owner approves ONE payment (a fraction of a cent; not a fee) on ${railName}. ${WALLET_PROOF_LINE} Ask your owner before making it.`;
+  const permission = cap ? `${STANDING_PERMISSION} Only pay within that cap.` : `${STANDING_PERMISSION} ${CAP_FROM_OWNER}`;
+
+  if (rail === 'sol') {
+    if (tx) finishProve(ctx, await proveReport(ctx, { step: 'wallet', rail: 'sol', signature: tx }));
+    // Phase 1: the exact payment, from the material. Nothing is paid or reported here.
+    const m = await fetchMaterial(ctx.site, ctx.handle, ctx.token);
+    const sol = m.sol && typeof m.sol === 'object' ? m.sol : null;
+    if (!sol || !sol.address) { console.error('No Solana payment target in the setup material — your owner re-issues the setup from the report page.'); process.exit(1); }
+    console.log(lead);
+    console.log(solMechanics(sol));
+    console.log(`  ${PROVE_WALLET_SOL_CMD} --tx <signature>`);
+    console.log(SOL_INDEX_LAG);
+    console.log(permission);
+    console.log(recordLine(ctx));
+    return;
+  }
+  // Lightning: the SAME report twice — the first mints the invoice (state "failed", invoice attached), the
+  // second, once paid, settles it. Phase 1 is "an invoice came back": print it, pay it, run again.
+  const r = await proveReport(ctx, { step: 'wallet', rail: 'lightning' });
+  const invoice = r.status === 200 && r.data.state !== 'proven' && typeof r.data.invoice === 'string' ? r.data.invoice : '';
+  if (!invoice) finishProve(ctx, r);
+  const sats = Number(r.data.sats) || 0;
+  console.log(lead);
+  console.log(lightningMechanics(sats));
+  console.log(`  ${PROVE_WALLET_LN_CMD}`);
+  console.log(`This run was the first report. Pay this invoice${r.data.expires_at ? ` (expires ${r.data.expires_at})` : ''}:`);
+  console.log(`  ${invoice}`);
+  console.log(permission);
+  console.log(`Then run \`${PROVE_WALLET_LN_CMD}\` again once paid.`);
+  console.log(recordLine(ctx));
+}
+
+// ── prove channel ──
+async function proveChannel(ctx) {
+  const code = String(flags.code || '').trim();
+  const email = String(flags.email || '').trim();
+  const text = String(flags.channel || '').trim();
+  if (code) finishProve(ctx, await proveReport(ctx, { step: 'channel', code }));
+  if (!email && !text) { console.error(`Which channel? ${PROVE_CHANNEL_CMD}  or  --channel "<text>"  — or report the emailed code: ${PROVE_CODE_CMD}`); process.exit(1); }
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { console.error(`--email needs an email address (got "${email}"). For another kind of channel use --channel "<text>".`); process.exit(1); }
+  const channel = email ? `email ${email}` : text;
+  const r = await proveReport(ctx, { step: 'channel', channel });
+  const extra = r.data.pending_code ? [`When it arrives, run:  ${PROVE_CODE_CMD}`] : (r.status === 200 && r.data.state === 'declared' && !email ? [CHANNEL_OTHER] : []);
+  finishProve(ctx, r, extra);
+}
+
+async function cmdProve() {
+  const what = positional[0];
+  if (!['endpoint', 'wallet', 'channel'].includes(what)) { console.error(PROVE_USAGE); process.exit(1); }
+  const ctx = resolveProveContext();
+  if (what === 'endpoint') await proveEndpoint(ctx);
+  else if (what === 'wallet') await proveWallet(ctx);
+  else await proveChannel(ctx);
+}
+
 if (cmd === 'help' || argv.includes('--help')) usage();
 else if (cmd === 'schedule') cmdSchedule();
 else if (cmd === 'handler') cmdHandler();
 else if (cmd === 'free') await cmdFree();
 else if (cmd === 'register') cmdRegister();
 else if (cmd === 'continuous') await cmdContinuous();
+else if (cmd === 'prove') await cmdProve();
 else cmdSetup();
