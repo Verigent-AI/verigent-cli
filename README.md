@@ -5,8 +5,9 @@ One-line onboarding for [Verigent](https://verigent.ai) — the battery every ha
 ```bash
 npx verigent <handle> <vgp_token>   # one-time setup: registers the Verigent MCP server
 npx verigent continuous <handle> --token <vgp_token>
-                                    # the one setup command for continuous verification (see below)
-npx verigent prove endpoint         # one command per proof step (see "Proving each step")
+                                    # the first setup command: connect + check (see below)
+npx verigent prove key              # one command per proof step (see "Proving each step")
+npx verigent prove endpoint
 npx verigent prove wallet --rail sol|lightning
 npx verigent prove channel --email <address>
 npx verigent schedule <handle>      # install the ~5x/day challenge-pull job (launchd/cron)
@@ -18,9 +19,9 @@ npx verigent handler                # run the sovereignty challenge endpoint (VG
 provenance, so the tarball on npm is attested to the exact commit and workflow that produced it. It
 writes one file, `~/.verigent/state.json` (mode 0600) — run state for cold-session resume — and makes
 HTTPS calls to verigent.ai only. The `schedule`, `continuous` and `prove endpoint` subcommands install
-a launchd/cron job; `continuous` also writes the signing key, the endpoint secret and the handle file
-under `<cwd>/.verigent/` (mode 0600), and `prove endpoint` writes the handler job's script and log
-there; nothing else touches your system. Package pins and integrity hashes:
+a launchd/cron job; `continuous` also writes the endpoint secret and the handle file under
+`<cwd>/.verigent/` (mode 0600), `prove key` writes the signing key there (mode 0600) when none exists,
+and `prove endpoint` writes the handler job's script and log there; nothing else touches your system. Package pins and integrity hashes:
 <https://verigent.ai/.well-known/verigent.json>.
 
 The scheduler it installs contains no credentials — the pull token lives only in the MCP
@@ -34,37 +35,37 @@ tells you the one sentence to give your agent to sit its first challenge cycle.
 
 Your agent's onboarding test is free. Watch it live at `https://verigent.ai/agent/<handle>`.
 
-## `npx verigent continuous` — the one setup command
+## `npx verigent continuous` — the first setup command: connect + check
 
-Your owner's report page issues a short setup prompt that carries this command. Run it once from the
-agent's working directory:
+Your owner's setup page shows this command as step 1. Run it once from the agent's working directory:
 
 ```bash
 npx verigent continuous <handle> --token <vgp_token> [--cwd <agent dir>] [--env KEY=VALUE ...] \
-  [--public-url <https url>] [--harness-version <v>] [--dry-run]
+  [--key <ed25519 pem>] [--public-url <https url>] [--harness-version <v>] [--dry-run]
 ```
 
-What it does, in order. Re-run it any time; a step already proven is skipped.
+It connects the agent and **checks** the other four proofs, reporting only what is already there. It
+never generates a key, installs a handler, opens a tunnel, pays or declares a channel; each step left
+is done later by its own one-line `prove` command, which the owner's setup page shows for that step.
+Re-run it any time; a step already proven is skipped.
 
 1. **Material.** `POST /api/agent/setup-material` with the handle and pull token (read-only). If the
    owner's page has not issued the setup yet it says so and exits 1; nothing below runs.
 2. **Connect.** Exactly `npx verigent <handle> <vgp_token>`: the MCP server entry plus the ~5x/day
    pull job. `CLAUDE_CONFIG_DIR` is carried from your shell into the job automatically when set
    (the job inherits nothing from the shell otherwise). The pull token is never in the job.
-3. **Signing key.** An Ed25519 key at `<cwd>/.verigent/<handle>.ed25519.pem` (mode 0600; reused if
-   present). It signs the server-issued nonce and reports the public key and signature. Keep the file:
-   real runs sign with the same key.
+3. **Signing key.** Only when a key already exists — `<cwd>/.verigent/<handle>.ed25519.pem`, or the
+   Ed25519 PKCS8 PEM named by `--key` — it signs the server-issued nonce and reports the public key and
+   signature. No key: nothing is generated or reported; the next step is `npx verigent prove key`.
 4. **Endpoint.** The HMAC secret is written to `<cwd>/.verigent/<handle>.hmac-secret` (mode 0600),
-   where `npx verigent handler` reads it (or set `VG_SECRET`). With `--public-url` the URL is
-   reported and Verigent challenges it. Without one the step is left unreported: it needs a public
-   HTTPS URL that reaches the handler on this machine — a tunnel (for example cloudflared) or a host
-   you control — then re-run with `--public-url <url>`.
-5. **Payment proof and output channel.** Never done by this command. It prints the facts from the
-   material (the Solana address, memo and minimum; the Lightning amount) and the exact report calls,
-   and tells the agent to ask its owner before any payment and which channel to declare. For an email
-   channel, Verigent sends a code to that address; the agent reports the code back to prove it.
-6. **Summary.** One table (step · result · note) and the record link. Exit 0 with steps left for the
-   agent is the normal outcome; exit 1 only when the material can't be had.
+   where `npx verigent handler` reads it. A URL is reported only when one is known: `--public-url`, or
+   the `endpoint_url` a successful `prove endpoint` saved in the handle file. Otherwise nothing is
+   reported; the next step is `npx verigent prove endpoint`.
+5. **Payment proof and output channel.** Never acted on here. The summary shows each as already
+   proven, declared, or the next step on the owner's setup page (`prove wallet` / `prove channel`
+   carry the mechanics).
+6. **Summary.** One table (step · result · next) and the record link. Exit 0 with steps left is the
+   normal outcome; exit 1 only when the material can't be had.
 
 Once material and connect succeed it also saves the **handle file**, `<cwd>/.verigent/<handle>.json`
 (mode 0600):
@@ -73,7 +74,9 @@ Once material and connect succeed it also saves the **handle file**, `<cwd>/.ver
 { "handle": "<handle>", "pull_token": "<vgp_token>", "site": "https://verigent.ai" }
 ```
 
-Every `prove` command reads it, so the per-step commands below carry no credentials.
+Every `prove` command reads it, so the per-step commands below carry no credentials. Once
+`prove endpoint` has proven a URL it adds `"endpoint_url"`, which a later `continuous` re-checks; a
+re-run of `continuous` keeps it.
 
 `--dry-run` prints every call it would make and writes nothing.
 
@@ -83,9 +86,17 @@ Your owner's report page hands the agent exactly ONE line per pending proof. The
 explanation and does the work; every result line is the server's own reason, never a claim made here.
 Exit 0 on proven / declared / instructions printed; exit 1 on an auth, material or usage failure.
 
-All three read the handle file. `--handle <h>` and `--token <vgp_token>` override it; with several
+All four read the handle file. `--handle <h>` and `--token <vgp_token>` override it; with several
 handle files in `<cwd>/.verigent` and no `--handle`, the command refuses and lists them. `--cwd <dir>`
 points at another agent directory.
+
+### `npx verigent prove key [--key <ed25519 pem>]`
+
+Reuses the signing key at `<cwd>/.verigent/<handle>.ed25519.pem` (or the Ed25519 PKCS8 PEM `--key`
+names) or, when there is none, generates one there (mode 0600). It signs the server-issued nonce and
+reports `{step:"identity", algorithm:"ed25519", public_key, signature}` — the raw public key (32
+bytes) and signature (64 bytes) as hex. Keep the file: real runs sign with the same key. Already
+proven: it says so and reports nothing.
 
 ### `npx verigent prove endpoint [--public-url <https url>] [--port 8787]`
 
@@ -108,7 +119,7 @@ is left alone, never restarted.
   and that URL is reported.
 
 Then `POST /api/agent/setup-proof {step:"endpoint", url}` — Verigent challenges the URL and the
-result line is its reason.
+result line is its reason. A proven URL is saved as `endpoint_url` in the handle file.
 
 ### `npx verigent prove wallet --rail sol|lightning [--cap "<text>"] [--tx <signature>]`
 
