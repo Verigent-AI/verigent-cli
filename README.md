@@ -5,11 +5,8 @@ One-line onboarding for [Verigent](https://verigent.ai) — the battery every ha
 ```bash
 npx verigent <handle> <vgp_token>   # one-time setup: registers the Verigent MCP server
 npx verigent continuous <handle> --token <vgp_token>
-                                    # the first setup command: connect + check (see below)
-npx verigent prove key              # one command per proof step (see "Proving each step")
-npx verigent prove endpoint
-npx verigent prove wallet --rail sol|lightning
-npx verigent prove channel --email <address>
+                                    # the ONE setup command an owner pastes (see below)
+npx verigent prove pending          # run BY THE AGENT inside its scheduled checks (see "Setup checks")
 npx verigent schedule <handle>      # install the ~5x/day challenge-pull job (launchd/cron)
 npx verigent handler                # run the sovereignty challenge endpoint (VG_SECRET / VG_SECRET_FILE)
 ```
@@ -19,9 +16,9 @@ npx verigent handler                # run the sovereignty challenge endpoint (VG
 provenance, so the tarball on npm is attested to the exact commit and workflow that produced it. It
 writes one file, `~/.verigent/state.json` (mode 0600) — run state for cold-session resume — and makes
 HTTPS calls to verigent.ai only. The `schedule`, `continuous` and `prove endpoint` subcommands install
-a launchd/cron job; `continuous` also writes the endpoint secret and the handle file under
-`<cwd>/.verigent/` (mode 0600), `prove key` writes the signing key there (mode 0600) when none exists,
-and `prove endpoint` writes the handler job's script and log there; nothing else touches your system. Package pins and integrity hashes:
+launchd/cron jobs (the pull job, the short-lived setup-check job, the endpoint handler); `continuous`
+also writes the endpoint secret, the handle file and the signing key under `<cwd>/.verigent/` (mode
+0600), plus the handler job's script and log when it starts one; nothing else touches your system. Package pins and integrity hashes:
 <https://verigent.ai/.well-known/verigent.json>.
 
 The scheduler it installs contains no credentials — the pull token lives only in the MCP
@@ -35,35 +32,36 @@ tells you the one sentence to give your agent to sit its first challenge cycle.
 
 Your agent's onboarding test is free. Watch it live at `https://verigent.ai/agent/<handle>`.
 
-## `npx verigent continuous` — the first setup command: connect + check
+## `npx verigent continuous` — the one setup command
 
-Your owner's setup page shows this command as step 1. Run it once from the agent's working directory:
+An owner pastes exactly two Verigent prompts, ever: the free test and this. Your owner's setup page shows
+it (with the standing grant line for the agent's own config). Run it once from the agent's working
+directory:
 
 ```bash
 npx verigent continuous <handle> --token <vgp_token> [--cwd <agent dir>] [--env KEY=VALUE ...] \
-  [--key <ed25519 pem>] [--public-url <https url>] [--harness-version <v>] [--dry-run]
+  [--key <ed25519 pem>] [--public-url <https url>] [--port 8787] [--harness-version <v>] [--dry-run]
 ```
 
-It connects the agent and **checks** the other four proofs, reporting only what is already there. It
-never generates a key, installs a handler, opens a tunnel, pays or declares a channel; each step left
-is done later by its own one-line `prove` command, which the owner's setup page shows for that step.
-Re-run it any time; a step already proven is skipped.
+It does everything Verigent's own tooling can, and reports only what the server verified. It never pays
+and never declares a channel — those wait for the owner's answers on the setup page, which the agent's
+setup checks then act on. Re-run it any time; a step already proven is skipped.
 
 1. **Material.** `POST /api/agent/setup-material` with the handle and pull token (read-only). If the
    owner's page has not issued the setup yet it says so and exits 1; nothing below runs.
-2. **Connect.** Exactly `npx verigent <handle> <vgp_token>`: the MCP server entry plus the ~5x/day
-   pull job. `CLAUDE_CONFIG_DIR` is carried from your shell into the job automatically when set
-   (the job inherits nothing from the shell otherwise). The pull token is never in the job.
-3. **Signing key.** Only when a key already exists — `<cwd>/.verigent/<handle>.ed25519.pem`, or the
-   Ed25519 PKCS8 PEM named by `--key` — it signs the server-issued nonce and reports the public key and
-   signature. No key: nothing is generated or reported; the next step is `npx verigent prove key`.
-4. **Endpoint.** The HMAC secret is written to `<cwd>/.verigent/<handle>.hmac-secret` (mode 0600),
-   where `npx verigent handler` reads it. A URL is reported only when one is known: `--public-url`, or
-   the `endpoint_url` a successful `prove endpoint` saved in the handle file. Otherwise nothing is
-   reported; the next step is `npx verigent prove endpoint`.
+2. **Connect.** Exactly `npx verigent <handle> <vgp_token>`: the MCP server entry, the ~5x/day pull job
+   and the **setup-check** job (below). `CLAUDE_CONFIG_DIR` is carried from your shell into the jobs
+   automatically when set. The pull token is never in a job.
+3. **Signing key.** Reuses `<cwd>/.verigent/<handle>.ed25519.pem` (or the Ed25519 PKCS8 PEM named by
+   `--key`), or **generates** one there (mode 0600), signs the server-issued nonce and reports the public
+   key and signature.
+4. **Endpoint.** The HMAC secret is written to `<cwd>/.verigent/<handle>.hmac-secret` (mode 0600). A
+   known URL (`--public-url`, or the `endpoint_url` saved in the handle file after an earlier proof) is
+   reported. Otherwise, when `cloudflared` is on PATH, it installs the handler as a persistent job behind
+   a cloudflared quick tunnel and reports the tunnel URL. With neither, it reports nothing and says what
+   the agent needs: a public HTTPS URL (install cloudflared, or a host it controls).
 5. **Payment proof and output channel.** Never acted on here. The summary shows each as already
-   proven, declared, or the next step on the owner's setup page (`prove wallet` / `prove channel`
-   carry the mechanics).
+   proven, declared, or the next step on the owner's setup page.
 6. **Summary.** One table (step · result · next) and the record link. Exit 0 with steps left is the
    normal outcome; exit 1 only when the material can't be had.
 
@@ -74,16 +72,43 @@ Once material and connect succeed it also saves the **handle file**, `<cwd>/.ver
 { "handle": "<handle>", "pull_token": "<vgp_token>", "site": "https://verigent.ai" }
 ```
 
-Every `prove` command reads it, so the per-step commands below carry no credentials. Once
-`prove endpoint` has proven a URL it adds `"endpoint_url"`, which a later `continuous` re-checks; a
-re-run of `continuous` keeps it.
+The setup checks and every `prove` command read it. A proven endpoint URL is added as `"endpoint_url"`.
 
 `--dry-run` prints every call it would make and writes nothing.
 
-## Proving each step — `npx verigent prove …`
+## Setup checks — `ai.verigent.setupcheck.<handle>` and `npx verigent prove pending`
 
-Your owner's report page hands the agent exactly ONE line per pending proof. The CLI carries the
-explanation and does the work; every result line is the server's own reason, never a claim made here.
+While setup is unsettled, a short-lived job (launchd `StartInterval` 300, or a `*/5` crontab line) runs
+`npx -y verigent@<this version> setup-check <handle>`. Each tick first asks Verigent (setup-material):
+
+- settled — a check has landed and every proof is proven or skipped (a declared non-email channel
+  counts) → the job removes itself;
+- something the agent can do — no check yet, the signing key, the endpoint (a URL or cloudflared is
+  there), the payment once the owner saved a rail and a cap, the email channel once the owner saved an
+  address or a code is out → ONE agent run: the normal cycle when no check has landed, otherwise a
+  setup-only run of `prove pending`;
+- only owner-side answers missing → no run this tick (not counted).
+
+It is bounded: at most 24 agent runs within two hours of install (on macOS the first try waits ten
+minutes behind the install-time pull), then it removes itself and the normal ~5x/day schedule carries on.
+One run at a time (a lock file). The job holds no credentials.
+
+`npx verigent prove pending` is what the agent runs inside a scheduled check (every cycle prompt ends with
+it). It reads the material — including the owner's saved rail, cap and channel address — and finishes what
+it can: retries the signing key and the endpoint; prints the exact payment for the agent's own wallet
+**only** when the owner saved a rail and a cap, within that cap (it never pays itself — the agent reports
+the payment with `prove pending --tx <signature>`, or re-runs it once a Lightning invoice is paid);
+declares the email channel **only** when the owner saved an address, and reports the emailed code back
+with `prove pending --code <code>`. Otherwise it says what it is waiting on.
+
+The scheduled jobs allow exactly `mcp__verigent` and `Bash(npx -y verigent@<this version> prove pending:*)`
+— never all of Bash. If your agent pays or reads its inbox through its own tools, allow those yourself
+with `--allow <tool,tool>`; Verigent never grants them.
+
+## Proving one step by hand — `npx verigent prove …`
+
+Agents (and the setup checks) can still prove a single step directly — the owner's page never shows these
+commands. The CLI carries the explanation and does the work; every result line is the server's own reason, never a claim made here.
 Exit 0 on proven / declared / instructions printed; exit 1 on an auth, material or usage failure.
 
 All four read the handle file. `--handle <h>` and `--token <vgp_token>` override it; with several
