@@ -25,11 +25,11 @@
 // token via MCP env, and the handler job reads its secret from a 0600 file named by VG_SECRET_FILE.
 
 import { spawnSync, spawn, execSync } from 'node:child_process';
-import { createHmac, generateKeyPairSync, createPrivateKey, createPublicKey, sign } from 'node:crypto';
+import { createHmac, timingSafeEqual, generateKeyPairSync, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { createServer } from 'node:http';
 import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, chmodSync, readdirSync, openSync, closeSync, statSync, utimesSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, basename, dirname } from 'node:path';
 
 const SITE = 'https://verigent.ai';
 // This package's own version (package.json ships in every npm tarball). The handler job pins
@@ -83,7 +83,7 @@ const setupPrompt = (handle) =>
   `Your operator's Verigent setup has proofs still pending. Run \`${pendingCmd(handle)}\` once ` +
   'and follow what it prints, within the operator authorisation recorded in your config: a payment only ' +
   'within the rail and cap your owner set on the setup page, from a wallet you control; an output-channel ' +
-  'code only from the inbox your owner named. ' + OWN_TOOLS + 'Report what you did in one line. ' + OWNER_REPORT + ' ' +
+  'code only from the inbox your owner named, or the inbox you read and declared as your own. ' + OWN_TOOLS + 'Report what you did in one line. ' + OWNER_REPORT + ' ' +
   'Stop and alert your operator if it asks for anything else.';
 // ── THE SCHEDULED RUNS' PERMISSIONS (#46, Ant 2026-10-07) ──────────────────────────────────────────────────
 // Every scheduled run is exactly `claude -p <prompt> --allowedTools <VERIGENT_ALLOWED[,--allow extras]>` — and
@@ -212,7 +212,8 @@ Usage:
                                         rules ADDED to the agent's own settings for the scheduled runs
                                         [--env KEY=VALUE ...]  extra env for the job; CLAUDE_CONFIG_DIR
                                         is carried over from your shell automatically when set
-  npx verigent handler                  run the sovereignty challenge endpoint
+  npx verigent handler                  run the sovereignty challenge endpoint (also answers Verigent's
+                                        signed "check now" by starting this agent's setup check)
                                         [--port 8787]  secret from VG_SECRET env (or --secret)
 
 Your handle and vgp_ token are in your welcome email. Docs: ${SITE}/agents.txt
@@ -620,7 +621,12 @@ const isEmail = (x) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(x || '').replace
 const bareEmail = (x) => String(x || '').replace(/^e-?mail\s*[:\-–—]?\s*/i, '').trim();
 
 /** What the setup-material says about setup, from the agent's side: settled? anything the agent can act on? */
-function setupPlan(m, { cwd, handle } = {}) {
+// #53 (Ant 2026-10-07 06:22): an agent that knows its own inbox declares its OWN output channel inside its setup
+// check — the owner's address on the page is the fallback. So a pending channel with no owner address is
+// something the AGENT can act on, for at most CHANNEL_SELF_ASKS setup-check runs (an agent with no inbox of
+// its own must not burn the run cap); after that it is an owner-side wait again.
+const CHANNEL_SELF_ASKS = 2;
+function setupPlan(m, { cwd, handle, channelSelfAsks = 0 } = {}) {
   const s = (m && m.steps) || {};
   const inp = (m && m.owner_inputs) || {};
   const ch = (m && m.channel) || {};
@@ -633,12 +639,14 @@ function setupPlan(m, { cwd, handle } = {}) {
   if (s.identity === 'pending') acts.push('signing key');
   if (endpointCan) acts.push('endpoint');
   if (s.wallet === 'pending' && inp.rail && inp.cap) acts.push('payment');
+  const selfChannel = s.channel === 'pending' && !isEmail(inp.channel) && channelSelfAsks < CHANNEL_SELF_ASKS;
   if ((s.channel === 'pending' && isEmail(inp.channel)) || (s.channel === 'declared' && !!ch.email)) acts.push('output channel');
+  else if (selfChannel) acts.push('output channel (its own inbox)');
   const waits = [];
   if (s.endpoint === 'pending' && !endpointCan) waits.push('a public URL for the endpoint');
   if (s.wallet === 'pending' && !(inp.rail && inp.cap)) waits.push('a rail + cap on the setup page');
-  if (s.channel === 'pending' && !isEmail(inp.channel)) waits.push('an email address on the setup page');
-  return { connected, settled: connected && done('identity') && done('endpoint') && done('wallet') && !channelOpen, acts, waits };
+  if (s.channel === 'pending' && !isEmail(inp.channel) && !selfChannel) waits.push('an email address on the setup page');
+  return { connected, settled: connected && done('identity') && done('endpoint') && done('wallet') && !channelOpen, acts, waits, selfChannel };
 }
 
 function installSetupCheck({ handle, cwd, claudeBin, allowed, extraEnv, npxBin }) {
@@ -845,14 +853,15 @@ async function cmdSetupCheck() {
     log(`setup-material answered HTTP ${r.status}${r.data && r.data.reason ? ` (${r.data.reason})` : ''} — no run this tick.`);
     process.exit(0);
   }
-  const plan = setupPlan(r.data, { cwd, handle });
+  const selfAsks = Number(st.channel_self_asks) || 0;
+  const plan = setupPlan(r.data, { cwd, handle, channelSelfAsks: selfAsks });
   if (plan.settled) { release(); finish('setup settled'); }
   if (!plan.acts.length) {
     release();
     log(`waiting on ${plan.waits.join(' · ') || 'nothing the agent can do'} — no run this tick.`);
     process.exit(0);
   }
-  count({ last_result: 'run' });
+  count({ last_result: 'run', ...(plan.selfChannel ? { channel_self_asks: selfAsks + 1 } : {}) });
   log(`to do: ${plan.acts.join(' · ')} — agent run ${tries + 1} of ${maxTries}${plan.connected ? ' (setup only)' : ''}.`);
   const prompt = plan.connected ? setupPrompt(handle) : cyclePrompt(handle);
   const extras = Array.isArray(st.allow_extra) ? st.allow_extra : legacyExtras(st.allowed);
@@ -880,6 +889,84 @@ function handlerSecret() {
   if (found.length === 1) return { secret: readFileSync(join(dir, found[0]), 'utf8').trim(), from: join(dir, found[0]) };
   return { secret: '', from: null };
 }
+
+// ── CHECK NOW (Kit walk S1 #49, Ant 2026-10-07 06:13: "If I click Check Again, that means Check Again right
+// now") ───────────────────────────────────────────────────────────────────────────────────────────────────────
+// Once the endpoint is proven, the owner's "Check again" makes Verigent POST a SIGNED check-now here:
+//   {"check_now":{"v":1,"handle":"<h>","ts":<unix ms>,"nonce":"<32 hex>"},"sig":"<hex>"}
+//   sig = HMAC-SHA256(this endpoint's secret, "verigent-check-now.v1.<h>.<ts>.<nonce>")
+// (one owner of the wire: functions/lib/check-now.ts; pinned on both sides by tests/check-now.test.mjs).
+// A valid one starts THIS agent's existing setup-check job immediately — launchd `kickstart` of
+// ai.verigent.setupcheck.<h> (never -k: a running tick is left alone), or on Linux one `setup-check` run — and
+// that job keeps its own no-overlap lock and its 24-run cap. It can do NOTHING else: no value from the request
+// reaches a command; the handle must be this handler's own.
+// Refused (no action, a bare 401): bad shape, a handle that isn't ours, a ts outside ±2 min, a ts not newer
+// than the last accepted one, a nonce already seen, a bad signature. At most one start per 30 s (429).
+// The challenge responder answers HEX challenges only (every Verigent challenge is hex), so it can never be
+// used to sign a check-now message (which has a non-hex prefix).
+const CHECK_NOW_SKEW_MS = 2 * 60 * 1000;
+const CHECK_NOW_MIN_GAP_MS = 30 * 1000;
+const CHALLENGE_RE = /^[0-9a-fA-F]{16,128}$/;
+const checkNowMessage = (handle, ts, nonce) => `verigent-check-now.v1.${handle}.${ts}.${nonce}`;
+
+/** Which agent this handler serves, and its directory: --handle / --cwd, else the secret file's own name
+ *  (<cwd>/.verigent/<handle>.hmac-secret — what `prove endpoint`'s job and `continuous` write). null = none
+ *  known → check-now is refused (the challenge responder is unaffected). */
+function handlerAgent(from) {
+  let handle = flags.handle ? String(flags.handle) : null;
+  let cwd = flags.cwd ? String(flags.cwd) : null;
+  if (from && from.endsWith('.hmac-secret') && basename(dirname(from)) === '.verigent') {
+    handle = handle || basename(from).slice(0, -'.hmac-secret'.length);
+    cwd = cwd || dirname(dirname(from));
+  }
+  if (!handle || !SAFE_HANDLE_RE.test(handle)) return null;
+  return { handle, cwd: cwd || process.cwd() };
+}
+
+/** Pure verdict on one check-now body (exported shape for the tests via `handler --self-test`-free import:
+ *  the tests drive it through a running handler). state: { lastTs, seen: Map<nonce, ts>, lastStartAt }. */
+function checkNowVerdict(body, { secret, agent, state, now = Date.now() }) {
+  const c = body && body.check_now;
+  if (!agent || !c || typeof c !== 'object') return { code: 401 };
+  if (c.v !== 1 || typeof c.handle !== 'string' || typeof c.nonce !== 'string' || typeof body.sig !== 'string') return { code: 401 };
+  if (!Number.isSafeInteger(c.ts) || !/^[0-9a-f]{32}$/.test(c.nonce) || !/^[0-9a-f]{64}$/.test(body.sig)) return { code: 401 };
+  if (c.handle.toLowerCase() !== agent.handle.toLowerCase()) return { code: 401 };
+  if (Math.abs(now - c.ts) > CHECK_NOW_SKEW_MS) return { code: 401 };
+  const want = createHmac('sha256', secret).update(checkNowMessage(c.handle, c.ts, c.nonce)).digest();
+  const got = Buffer.from(body.sig, 'hex');
+  if (got.length !== want.length || !timingSafeEqual(got, want)) return { code: 401 };
+  // Replay: strictly newer than the last accepted ts, and a nonce never seen (kept for the skew window).
+  for (const [n, t] of state.seen) if (now - t > 2 * CHECK_NOW_SKEW_MS) state.seen.delete(n);
+  if (c.ts <= state.lastTs || state.seen.has(c.nonce)) return { code: 401 };
+  state.seen.set(c.nonce, now);
+  state.lastTs = c.ts;
+  if (now - state.lastStartAt < CHECK_NOW_MIN_GAP_MS) return { code: 429 };
+  state.lastStartAt = now;
+  return { code: 202 };
+}
+
+/** Start this agent's setup check NOW — the existing job, nothing else. Returns { started, reason }. */
+function startSetupCheckNow(agent) {
+  const { handle, cwd } = agent;
+  if (process.env.VERIGENT_CHECK_NOW_DRY === '1') return { started: true, reason: 'dry-run' }; // tests: never touches launchd/cron
+  const st = readSetupCheckState(cwd, handle);
+  if (!st || st.done) return { started: false, reason: 'no_setup_check' };
+  if (process.platform === 'darwin') {
+    if (!existsSync(setupCheckPlistPath(handle))) return { started: false, reason: 'no_setup_check' };
+    const r = run('launchctl', ['kickstart', `gui/${process.getuid()}/${jobLabel('setupcheck', handle)}`], { stdio: 'ignore' });
+    return r.status === 0 ? { started: true, reason: null } : { started: false, reason: 'kickstart_failed' };
+  }
+  if (process.platform === 'linux') {
+    try {
+      const out = openSync(join(cwd, '.verigent-pull.log'), 'a');
+      const child = spawn('npx', ['-y', `verigent@${PKG_VERSION}`, 'setup-check', handle, '--cwd', cwd], { cwd, detached: true, stdio: ['ignore', out, out] });
+      child.unref();
+      return { started: true, reason: null };
+    } catch { return { started: false, reason: 'spawn_failed' }; }
+  }
+  return { started: false, reason: 'unsupported_platform' };
+}
+
 function cmdHandler() {
   const { secret, from } = handlerSecret();
   const port = parseInt(flags.port || '8787', 10);
@@ -887,7 +974,10 @@ function cmdHandler() {
     console.error('Set the per-run secret first: VG_SECRET=<secret> npx verigent handler  (or --secret <secret>, or VG_SECRET_FILE=<path> / --secret-file <path>)');
     process.exit(1);
   }
-  if (dryRun) { console.log(`[dry-run] would listen on :${port}, HMAC-SHA256 responder, secret from ${from}`); return; }
+  const agent = handlerAgent(from);
+  if (dryRun) { console.log(`[dry-run] would listen on :${port}, HMAC-SHA256 responder, secret from ${from}${agent ? `; check-now starts ${jobLabel('setupcheck', agent.handle)}` : '; check-now off (no handle)'}`); return; }
+  const cnState = { lastTs: 0, seen: new Map(), lastStartAt: 0 };
+  const reply = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
   const server = createServer((req, res) => {
     if (req.method !== 'POST') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -897,21 +987,26 @@ function cmdHandler() {
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 65536) req.destroy(); });
     req.on('end', () => {
-      try {
-        const { challenge } = JSON.parse(body);
-        if (typeof challenge !== 'string' || !challenge) throw new Error('bad challenge');
-        const proof = createHmac('sha256', secret).update(challenge).digest('hex');
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ proof, timestamp: new Date().toISOString() }));
-      } catch {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'expected JSON body: {"challenge":"<hex>"}' }));
+      let j;
+      try { j = JSON.parse(body); } catch { j = null; }
+      if (j && typeof j === 'object' && 'check_now' in j) {
+        const v = checkNowVerdict(j, { secret, agent, state: cnState });
+        if (v.code === 401) return reply(res, 401, { ok: false, error: 'refused' });
+        if (v.code === 429) return reply(res, 429, { ok: false, error: 'busy' });
+        const s = startSetupCheckNow(agent);
+        console.log(`[check-now ${new Date().toISOString()}] ${agent.handle}: ${s.started ? 'setup check started' : `not started (${s.reason})`}`);
+        return reply(res, 202, { ok: true, started: s.started, ...(s.started ? {} : { reason: s.reason }) });
       }
+      const challenge = j && typeof j === 'object' ? j.challenge : undefined;
+      if (typeof challenge !== 'string' || !CHALLENGE_RE.test(challenge)) return reply(res, 400, { error: 'expected JSON body: {"challenge":"<hex>"}' });
+      const proof = createHmac('sha256', secret).update(challenge).digest('hex');
+      reply(res, 200, { proof, timestamp: new Date().toISOString() });
     });
   });
   server.listen(port, () => {
     console.log(`Verigent challenge handler listening on :${port}
 Contract: POST {"challenge":"<32-hex>"} → {"proof":"<hmac-sha256 hex>","timestamp":"<ISO>"}
+${agent ? `Check now: a signed request from Verigent starts ${jobLabel('setupcheck', agent.handle)} (nothing else).` : 'Check now: off (no handle known — pass --handle <h>).'}
 
 Expose it at a public HTTPS URL you control (a Worker, VPS, tunnel — hosting it
 yourself IS the infrastructure-independence proof), then report that URL:
@@ -1263,15 +1358,31 @@ async function cmdContinuous() {
 // ── prove pending (#39) — the AGENT runs this inside its scheduled check; the owner never sees it ──
 // Reads setup-material (incl. the owner's saved rail · cap · channel) and finishes what it can: the signing
 // key and the endpoint are retried; the payment ONLY when the owner saved a rail + cap (it prints the exact
-// payment for the agent's own wallet, within that cap — never pays itself); the email channel ONLY when the
-// owner saved an address (declares it; the code goes there) — the agent reports the code back once it finds
-// it in that inbox. Follow-ups are the same command with --tx / --paid / --code. Exit 0 unless auth fails.
+// payment for the agent's own wallet, within that cap — never pays itself); the email channel: the owner's saved
+// address when there is one (declared; the code goes there), else (#53) the agent is told to declare the inbox
+// it reads itself (--email) — either way it reports the code back once it finds it in that inbox. Follow-ups
+// are the same command with --tx / --paid / --code / --email. Exit 0 unless auth fails.
 async function provePending(ctx) {
   const PENDING_CMD = pendingCmd(ctx.handle);
   const tx = String(flags.tx || '').trim();
   const code = String(flags.code || '').trim();
   if (tx) { const r = await postProof(ctx, { step: 'wallet', rail: 'sol', signature: tx }); console.log(`payment: ${resultLine(r)}`); console.log(recordLine(ctx)); process.exit(r.status === 200 ? 0 : 1); }
   if (code) { const r = await postProof(ctx, { step: 'channel', code }); console.log(`output channel: ${resultLine(r)}`); console.log(recordLine(ctx)); process.exit(r.status === 200 ? 0 : 1); }
+  // #53: the agent declares the inbox it reads as its own output channel — the same declaration (and the same
+  // code email) as an address the owner typed on the page.
+  const selfEmail = String(flags.email || '').trim();
+  if (flags.email !== undefined) {
+    if (!isEmail(selfEmail)) { console.error('output channel: --email needs the email address of an inbox you read.'); process.exit(1); }
+    const addr = bareEmail(selfEmail);
+    const r = await postProof(ctx, { step: 'channel', channel: `email ${addr}` });
+    console.log(`output channel: ${resultLine(r)}`);
+    if (r.data && r.data.pending_code) {
+      console.log(`A code is on its way to ${addr}. Find Verigent's email with the code for this agent's output channel in that inbox — now, or on your next check — then run:`);
+      console.log(`  ${PENDING_CMD} --code <code>`);
+    }
+    console.log(recordLine(ctx));
+    process.exit(r.status === 200 ? 0 : 1);
+  }
   // #47 b: every pull ends here — tell Verigent when this agent's next check is due (omitted when unknown).
   const next = nextCheckAt(ctx.cwd, ctx.handle);
   const m = await fetchMaterial(ctx.site, ctx.handle, ctx.token, next ? { next_check_at: next } : null);
@@ -1340,8 +1451,15 @@ async function provePending(ctx) {
     console.log(`  ${PENDING_CMD} --code <code>`);
   } else if (s.channel === 'pending' || (s.channel === 'declared' && ch.email)) {
     const email = isEmail(inp.channel) ? bareEmail(inp.channel) : (ch.email || '');
-    if (!email) console.log('output channel: waiting for your owner to type an email address on the setup page — nothing to do now.');
-    else {
+    if (!email) {
+      // #53: no address from the owner — the agent tries its OWN inbox first; the page's field is the fallback.
+      acted = true;
+      console.log("output channel: your owner hasn't named an inbox. If you read an email inbox of your own, declare it — Verigent emails a code there:");
+      console.log(`  ${PENDING_CMD} --email <your address>`);
+      console.log(`Then find Verigent's email with the code in that inbox (on this check or your next one) and run:`);
+      console.log(`  ${PENDING_CMD} --code <code>`);
+      console.log("Only to read the code Verigent sends there. If you don't read an inbox of your own, leave this — your owner can type one on the setup page.");
+    } else {
       acted = true;
       const r = await postProof(ctx, { step: 'channel', channel: `email ${email}` });
       console.log(`output channel: ${resultLine(r)}`);
@@ -1487,7 +1605,7 @@ function installHandlerJob({ handle, cwd, port, withTunnel, cloudflaredBin, secr
   const npxDir = (which('npx') || '/usr/local/bin/npx').replace(/\/[^/]+$/, '');
   const dirs = [npxDir, cloudflaredBin ? cloudflaredBin.replace(/\/[^/]+$/, '') : null, '/usr/local/bin', '/opt/homebrew/bin', '/usr/bin', '/bin'].filter(Boolean);
   const pathEnv = [...new Set(dirs)].join(':');
-  const handlerCmd = `npx -y verigent@${PKG_VERSION} handler --port ${port}`;
+  const handlerCmd = `npx -y verigent@${PKG_VERSION} handler --port ${port} --handle ${handle}`;
   const script = `#!/bin/sh
 # Installed by \`${PROVE_ENDPOINT_CMD}\` for ${handle} (job ${label}).
 # Runs the Verigent challenge handler on :${port}${withTunnel ? ' behind a cloudflared quick tunnel' : ''}.

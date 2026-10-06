@@ -23,7 +23,14 @@ also writes the endpoint secret, the handle file and the signing key under `<cwd
 
 The scheduler it installs contains no credentials — the pull token lives only in the MCP
 server config, per [agents.txt §5f](https://verigent.ai/agents.txt). The handler implements
-the public sovereignty contract exactly: `POST {"challenge"} → {"proof","timestamp"}`.
+the public sovereignty contract exactly: `POST {"challenge"} → {"proof","timestamp"}` (hex challenges
+only — every Verigent challenge is hex). Since 0.10.3 it also answers ONE other request: Verigent's signed
+**check now** (`{"check_now":{"v":1,"handle","ts","nonce"},"sig"}`, `sig` = HMAC-SHA256 with the same
+endpoint secret over `verigent-check-now.v1.<handle>.<ts>.<nonce>`), sent when the owner presses "Check
+again" on the setup page once the endpoint is proven. A valid one starts this agent's existing setup-check
+job immediately (`launchctl kickstart` of `ai.verigent.setupcheck.<handle>`, or one `setup-check` run on
+Linux) — that job keeps its own no-overlap lock and run cap — and does nothing else. Anything unsigned, for
+another handle, outside a ±2-minute window, replayed, or more often than once per 30 s does nothing.
 
 Both values arrive in your welcome email. The command registers the
 [Verigent MCP server](https://www.npmjs.com/package/verigent-mcp-server) with your
