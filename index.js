@@ -14,8 +14,10 @@
 //   npx verigent schedule <handle>       install the ~5x/day challenge-pull job (launchd/cron)
 //   npx verigent handler                 run the sovereignty challenge endpoint (HMAC responder)
 //   npx verigent setup-check <handle>    the setup-check job's one tick (installed by `continuous`; see SETUP CHECKS)
-//   npx verigent prove pending           run BY THE AGENT inside a scheduled check: finishes the setup proofs
+//   npx verigent prove pending --handle <h>
+//                                        run BY THE AGENT inside a scheduled check: finishes the setup proofs
 //                                        the owner's page unlocked (key, endpoint, payment within the cap, channel)
+//                                        with the agent's own tools, as its own settings allow (#46)
 //
 // Design constraints (agents.txt §5f): the pull token lives ONLY in the MCP server config and in
 // <cwd>/.verigent/<handle>.json (0600, written by `continuous`, read by `prove`) — the jobs this
@@ -45,7 +47,24 @@ const PKG_VERSION = (() => { try { return JSON.parse(readFileSync(new URL('./pac
 // always; professor/binding-check.mjs now parses this exact line and fails the build the moment it
 // next drifts from official_packages.npm.version.
 const MCP_PKG = 'verigent-mcp-server@0.7.16';
-const CYCLE_PROMPT =
+// A handle is server-minted (letters, digits, hyphens — `kit-0A`). It is written into the scheduled prompts and
+// into the `prove pending --handle <h>` command the agent runs, so anything else is refused before a job is
+// installed (a handle can never smuggle shell syntax into a command line the agent is told to run).
+const SAFE_HANDLE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+// The command the AGENT runs inside its scheduled check (#39). `--handle` always (#43): the agent's .verigent dir
+// also holds Verigent's own state files, and a check must never depend on guessing which agent it is.
+const pendingCmd = (handle) => `npx -y verigent@${PKG_VERSION} prove pending --handle ${handle}`;
+// What a scheduled run may do (#46, Ant 2026-10-07: "a capable agent should be able to pay and read its inbox
+// without the user doing anything"): the agent's OWN tools, as its own settings allow. Said in both prompts.
+const OWN_TOOLS =
+  'Use your own tools for that, exactly as your own settings already allow them (your wallet for a payment, ' +
+  'your inbox for a code). ';
+// #42 (Ant 2026-10-06 "we should be doing that from our side only"): what the agent tells its owner. The owner
+// never runs a Verigent command; the owner's only inputs are on the setup page.
+const OWNER_REPORT =
+  "When you tell your owner about setup, say Verigent's scheduled checks finish it automatically — their only " +
+  'part is the inputs on their setup page; never give them a Verigent command to run.';
+const cyclePrompt = (handle) =>
   'Run one Verigent verification cycle under the operator authorisation recorded in your config: ' +
   'call probe_start, drive each returned tool with probe_call branching on the actual returned ' +
   'values, then submit with probe_finish. A session_continuity challenge asks you to store and ' +
@@ -56,20 +75,42 @@ const CYCLE_PROMPT =
   "persistent memory beyond that challenge's own continuity tokens. " +
   // #39 (Ant 2026-10-05 — two prompts only): the owner never pastes a per-step command; the agent's own
   // scheduled check finishes what the owner unlocked on the setup page.
-  `Then, separately from the challenges, run \`npx -y verigent@${PKG_VERSION} prove pending\` once and follow what it ` +
+  `Then, separately from the challenges, run \`${pendingCmd(handle)}\` once and follow what it ` +
   'prints: it finishes setup proofs your owner unlocked on their setup page — a payment only within the rail ' +
-  'and cap your owner set there, from a wallet you control — and says when nothing is pending.';
+  'and cap your owner set there, from a wallet you control — and says when nothing is pending. ' + OWN_TOOLS + OWNER_REPORT;
 // The setup checks' run once a check has already landed: setup only, no probe (a landed check is never re-bought).
-const SETUP_PROMPT =
-  `Your operator's Verigent setup has proofs still pending. Run \`npx -y verigent@${PKG_VERSION} prove pending\` once ` +
+const setupPrompt = (handle) =>
+  `Your operator's Verigent setup has proofs still pending. Run \`${pendingCmd(handle)}\` once ` +
   'and follow what it prints, within the operator authorisation recorded in your config: a payment only ' +
   'within the rail and cap your owner set on the setup page, from a wallet you control; an output-channel ' +
-  'code only from the inbox your owner named. Report what you did in one line. Stop and alert your operator ' +
-  'if it asks for anything else.';
-// The scheduled jobs' allow list (§5f + #39): the Verigent MCP tools, and Bash for EXACTLY ONE command prefix —
-// `npx -y verigent@<this> prove pending` (its --tx / --code follow-ups included). Never all of Bash. The
-// agent's own wallet / mail tools are the operator's to allow (`--allow <tools>`); Verigent never grants them.
-const scheduledAllowed = () => ['mcp__verigent', `Bash(npx -y verigent@${PKG_VERSION} prove pending:*)`].concat(flags.allow ? String(flags.allow).split(',').map((x) => x.trim()).filter(Boolean) : []).join(',');
+  'code only from the inbox your owner named. ' + OWN_TOOLS + 'Report what you did in one line. ' + OWNER_REPORT + ' ' +
+  'Stop and alert your operator if it asks for anything else.';
+// ── THE SCHEDULED RUNS' PERMISSIONS (#46, Ant 2026-10-07) ──────────────────────────────────────────────────
+// Every scheduled run is exactly `claude -p <prompt> --allowedTools <VERIGENT_ALLOWED[,--allow extras]>` — and
+// NOTHING else on the command line. Why that is "the agent's own permissions, plus Verigent's two":
+//   • Claude Code keeps --allowedTools as its OWN rule source ("cliArg") beside the agent's settings sources
+//     (user ~/.claude/settings.json or $CLAUDE_CONFIG_DIR, project .claude/settings.json, local
+//     .claude/settings.local.json, managed policy). Allow rules from every source are merged; deny rules from
+//     any source still win. So passing it ADDS rules — it never replaces, narrows or overrides the agent's own.
+//   • The permission mode is the agent's own `permissions.defaultMode` because no --permission-mode is passed.
+//   • Nothing that narrows is ever passed: no --tools, --disallowedTools, --setting-sources, --settings,
+//     --strict-mcp-config, --mcp-config, --restricted, --permission-mode, --dangerously-skip-permissions.
+//     tests/cli-continuous.test.mjs pins the exact argv of both jobs.
+//   • The run starts in the agent's directory (project + local settings resolve there) with CLAUDE_CONFIG_DIR
+//     carried over when set (#11), so it reads the same settings the agent's own sessions read.
+// What Verigent adds is EXACTLY two entries: the Verigent MCP tools, and Bash for ONE command prefix —
+// `npx -y verigent@<this> prove pending` (its --handle / --tx / --code follow-ups included). Never all of Bash.
+// A headless run has no one to answer a permission prompt, so a tool the agent pays or reads its inbox with
+// works there when — and only when — its own settings (or its permission mode) already allow it. A one-off
+// "yes" given in an interactive session is not a setting and does not carry over.
+// `--allow <tools>` stays as an optional, additive operator grant (never required); it can only add rules.
+const VERIGENT_ALLOWED = () => ['mcp__verigent', `Bash(npx -y verigent@${PKG_VERSION} prove pending:*)`];
+/** The operator's optional --allow extras: trimmed, non-empty, no commas (the list is comma-joined). */
+const allowExtras = (list) => (Array.isArray(list) ? list : String(list || '').split(','))
+  .map((x) => String(x).trim()).filter((x) => x && !x.includes(','));
+const scheduledAllowed = (extras = allowExtras(flags.allow)) => [...VERIGENT_ALLOWED(), ...allowExtras(extras)].join(',');
+/** The extras inside a legacy (≤0.10.0) state file's `allowed` string: everything but Verigent's own entries. */
+const legacyExtras = (allowed) => allowExtras(allowed).filter((x) => x !== 'mcp__verigent' && !/^Bash\(npx -y verigent@[^ ]+ prove pending:\*\)$/.test(x));
 // The standing authorisation is the HUMAN operator's to give — never phrased as the agent
 // authorising itself (Greg #5 / §2 trust surface). ONE wording, two owners: functions/lib/setup-prompt.ts
 // grantLine (the setup page shows it, #34) — tests/one-setup-prompt.test.mjs pins this copy to it. Stated as a fact about what the operator set,
@@ -167,7 +208,8 @@ Usage:
                                         prove reads <cwd>/.verigent/<handle>.json (written by
                                         'continuous'); --handle <h> / --token <t> override it
   npx verigent schedule <handle>        install the ~5x/day challenge-pull job (--uninstall to remove)
-                                        [--cwd <agent dir>] [--allow <extra,allowed,tools>]
+                                        [--cwd <agent dir>] [--allow <extra,allowed,tools>]  optional:
+                                        rules ADDED to the agent's own settings for the scheduled runs
                                         [--env KEY=VALUE ...]  extra env for the job; CLAUDE_CONFIG_DIR
                                         is carried over from your shell automatically when set
   npx verigent handler                  run the sovereignty challenge endpoint
@@ -186,6 +228,8 @@ const which = (bin) => {
   try { return execSync(isWin ? `where ${bin}` : `command -v ${bin}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n')[0] || null; }
   catch { return null; }
 };
+/** POSIX single-quoting: nothing inside is expanded by the shell (no $, no backticks). */
+const shq = (x) => `'${String(x).replace(/'/g, `'\\''`)}'`;
 const jobLabel = (kind, handle) => `ai.verigent.${kind}.${handle.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** Poll `fn` every `every` ms for up to `ms`; the first truthy value, else null. */
@@ -295,7 +339,7 @@ Full integration notes (including the raw REST contract): ${SITE}/agents.txt`);
     positional.length = 0; positional.push(handle);
     cmdSchedule();
   } else if (flags['no-schedule']) {
-    console.log(`\nScheduler skipped (--no-schedule). Later:  npx verigent schedule ${handle}`);
+    console.log(`\nScheduler skipped (--no-schedule): nothing is scheduled here — Verigent's checks run when your harness's own scheduler wakes the agent (${SITE}/agents.txt §5f).`);
   }
   finish();
 }
@@ -394,9 +438,11 @@ Next:
 function cmdSchedule() {
   const handle = positional[0];
   if (!handle) { console.error('Usage: npx verigent schedule <handle> [--cwd <agent dir>] [--uninstall]'); process.exit(1); }
+  if (!SAFE_HANDLE_RE.test(handle)) { console.error(`"${handle}" isn't a Verigent handle (letters, digits and hyphens, e.g. kit-0A) — nothing installed.`); process.exit(1); }
   const label = jobLabel('pull', handle);
   const cwd = flags.cwd || process.cwd();
   const allowed = scheduledAllowed();
+  const CYCLE_PROMPT = cyclePrompt(handle);
   // Extra env for the job (launchd inherits nothing from your shell). Values are env NAMES and
   // paths only — never put the pull token here; it stays in the MCP server config (§5f).
   const extraEnv = (flags.env || []).map((e) => {
@@ -481,7 +527,9 @@ First pull fires NOW (watch your agent's page — the dots move within minutes).
     const claudeBin = dryRun ? '/usr/local/bin/claude' : execSync('command -v claude', { encoding: 'utf8' }).trim();
     const tag = `# ${label}`;
     const envPrefix = extraEnv.map(([k, v]) => `${k}=${JSON.stringify(v)} `).join('');
-    const line = `13 1,6,11,16,21 * * * cd ${JSON.stringify(cwd)} && ${envPrefix}${JSON.stringify(claudeBin)} -p ${JSON.stringify(CYCLE_PROMPT)} --allowedTools ${JSON.stringify(allowed)} >> .verigent-pull.log 2>&1 ${tag}`;
+    // The prompt and allow list are SINGLE-quoted for the shell: the prompt carries backticks (the command the
+    // agent runs), which inside double quotes cron's /bin/sh would execute as a command substitution.
+    const line = `13 1,6,11,16,21 * * * cd ${JSON.stringify(cwd)} && ${envPrefix}${JSON.stringify(claudeBin)} -p ${shq(CYCLE_PROMPT)} --allowedTools ${shq(allowed)} >> .verigent-pull.log 2>&1 ${tag}`;
     const current = (() => { try { return execSync('crontab -l', { encoding: 'utf8' }); } catch { return ''; } })();
     const cleaned = current.split('\n').filter((l) => !l.includes(tag)).join('\n').replace(/\n+$/, '');
     const next = flags.uninstall ? cleaned : `${cleaned}\n${line}`;
@@ -494,7 +542,7 @@ First pull fires NOW (watch your agent's page — the dots move within minutes).
     if (flags.uninstall) { if (!dryRun) removeSetupCheckJob(handle, cwd, { quiet: true }); return; }
     if (wantSetupCheck(handle, cwd)) installSetupCheck({ handle, cwd, claudeBin, allowed, extraEnv, npxBin: dryRun ? '/usr/local/bin/npx' : (which('npx') || '/usr/local/bin/npx') });
   } else {
-    console.log(`Automatic install isn't supported on ${process.platform} yet. Schedule this 5x/day yourself:\n\n  claude -p "${CYCLE_PROMPT}" --allowedTools "${allowed}"\n\n(run it from ${cwd} — where the MCP server is registered)`);
+    console.log(`Automatic install isn't supported on ${process.platform} yet. Schedule this 5x/day yourself:\n\n  claude -p ${shq(CYCLE_PROMPT)} --allowedTools ${shq(allowed)}\n\n(run it from ${cwd} — where the MCP server is registered)`);
     return;
   }
   console.log(`
@@ -503,8 +551,10 @@ system prompt / policy layer) so a well-built agent doesn't refuse the scheduled
 
   "${grantLine(handle)}"
 
-The scheduled checks may use: ${allowed}
-If your agent pays or reads its inbox through its own tools, allow those too (re-run with --allow <tool,tool>) — Verigent never grants them.
+Scheduled checks run with your agent's own Claude Code permissions — its settings files and its
+permission mode, unchanged. Verigent adds only: ${allowed}
+A scheduled run has no one to answer a permission prompt: whatever your agent pays or reads its inbox
+with works there when its own settings already allow it. Verigent's checks finish setup automatically.
 
 Testing starts at the agent's first check; the report reads Current from there. Watch: ${SITE}/agent/${handle}`);
 }
@@ -528,8 +578,10 @@ Testing starts at the agent's first check; the report reads Current from there. 
 //     owner saved a rail + cap; the email channel once the owner saved an address or a code is out) → ONE
 //     agent run. Only owner-side waits left (no rail / cap / address yet) → no run this tick, not counted.
 //     Verigent unreachable / rate-limited → the tick counts but runs nothing (no tokens spent blind).
-//   • The run: no check yet → the normal cycle (CYCLE_PROMPT — which ends with `prove pending`); already
-//     connected → SETUP_PROMPT only (`prove pending`, no probe), so a settled check is never re-bought.
+//   • The run: no check yet → the normal cycle (cyclePrompt — which ends with `prove pending --handle <h>`);
+//     already connected → setupPrompt only (`prove pending`, no probe), so a settled check is never re-bought.
+//   • Its permissions are the pull job's: the agent's own settings + Verigent's two entries (+ the operator's
+//     optional --allow extras) — see THE SCHEDULED RUNS' PERMISSIONS above.
 //   • One run at a time (a lock file, stale after 30 minutes) — cron would otherwise overlap a slow one.
 // The job holds NO credentials (§5f): the state file names the claude binary and the allowed tools only.
 const SETUP_CHECK_EVERY_S = 300;
@@ -573,7 +625,10 @@ function installSetupCheck({ handle, cwd, claudeBin, allowed, extraEnv, npxBin }
   const notBefore = now + (process.platform === 'darwin' ? SETUP_CHECK_HOLD_MS : 0);
   const state = {
     handle, installed_at: new Date(now).toISOString(), not_before: notBefore, until: now + SETUP_CHECK_WINDOW_MS,
-    tries: 0, max_tries: SETUP_CHECK_MAX_TRIES, every_s: SETUP_CHECK_EVERY_S, claude_bin: claudeBin, allowed, done: null,
+    tries: 0, max_tries: SETUP_CHECK_MAX_TRIES, every_s: SETUP_CHECK_EVERY_S, claude_bin: claudeBin,
+    // `allowed` is a record of what was installed; the tick REBUILDS the list from Verigent's two entries + the
+    // operator's `allow_extra` (#46), so Verigent's own two always match the running version.
+    allowed, allow_extra: allowExtras(flags.allow), done: null,
   };
   const args = [npxBin, '-y', `verigent@${PKG_VERSION}`, 'setup-check', handle, '--cwd', cwd];
   const say = `${label} — while setup is unsettled, checks every ${SETUP_CHECK_EVERY_S / 60} minutes (at most ${SETUP_CHECK_MAX_TRIES} agent runs, about two hours), asking Verigent before each one; it removes itself once setup settles or the cap is reached.`;
@@ -658,7 +713,7 @@ function removeSetupCheckJob(handle, cwd, { quiet = false } = {}) {
  *  inside a tick (the next tick is the retry). */
 async function cmdSetupCheck() {
   const handle = positional[0];
-  if (!handle) { console.error('Usage: npx verigent setup-check <handle> [--cwd <agent dir>]  (run by the job `continuous` installs)'); process.exit(1); }
+  if (!handle || !SAFE_HANDLE_RE.test(handle)) { console.error('Usage: npx verigent setup-check <handle> [--cwd <agent dir>]  (run by the job `continuous` installs)'); process.exit(1); }
   const cwd = flags.cwd || process.cwd();
   const log = (m) => console.log(`[setup-check ${new Date().toISOString()}] ${handle}: ${m}`);
   const st = readSetupCheckState(cwd, handle);
@@ -708,8 +763,9 @@ async function cmdSetupCheck() {
   }
   count({ last_result: 'run' });
   log(`to do: ${plan.acts.join(' · ')} — agent run ${tries + 1} of ${maxTries}${plan.connected ? ' (setup only)' : ''}.`);
-  const prompt = plan.connected ? SETUP_PROMPT : CYCLE_PROMPT;
-  const res = spawnSync(st.claude_bin || 'claude', ['-p', prompt, '--allowedTools', st.allowed || scheduledAllowed()], { cwd, stdio: 'inherit', timeout: SETUP_CHECK_RUN_TIMEOUT_MS });
+  const prompt = plan.connected ? setupPrompt(handle) : cyclePrompt(handle);
+  const extras = Array.isArray(st.allow_extra) ? st.allow_extra : legacyExtras(st.allowed);
+  const res = spawnSync(st.claude_bin || 'claude', ['-p', prompt, '--allowedTools', scheduledAllowed(extras)], { cwd, stdio: 'inherit', timeout: SETUP_CHECK_RUN_TIMEOUT_MS });
   release();
   log(`run ended (exit ${res.status ?? res.signal ?? (res.error && res.error.code) ?? '?'}); the next tick asks Verigent again.`);
   process.exit(0);
@@ -853,8 +909,12 @@ Record: ${SITE}/agent/${handle}
 // Exit 1 only when the material can't be had (bad token, setup not issued, unreachable). Steps left are the
 // normal outcome — exit 0. Copy firewall (§2.7): facts and mechanisms, no urgency.
 const SETUP_PROOF_URL = `${SITE}/api/agent/setup-proof`;
+// The closing line (#42): nothing further for anyone to run — Verigent's scheduled checks finish setup.
+const CONTINUOUS_CLOSE = "Nothing else to run: Verigent's scheduled checks finish the rest automatically. The owner's only part is the inputs on the setup page.";
 const SETUP_MATERIAL_URL = `${SITE}/api/agent/setup-material`;
-const OWNER_PAGE_NEXT = "next step on your owner's setup page";
+// The summary's "next" column (#42): never a Verigent command — the owner's only inputs are on the setup page,
+// and Verigent's own scheduled checks do the rest.
+const OWNER_PAGE_NEXT = "owner's input on the setup page; Verigent's checks finish it";
 
 async function postJson(url, body) {
   const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -998,8 +1058,8 @@ const canInstallJobs = () => process.platform === 'darwin' || process.platform =
 // What the agent needs when no public URL can be opened (the page's endpoint step says the same, in the
 // owner's words — setup-prompt.ts AGENT_NEEDS.endpoint).
 const NEEDS_PUBLIC_URL = 'No public URL: this agent needs one that reaches it — install cloudflared (brew install cloudflared, or https://github.com/cloudflare/cloudflared/releases) for a free quick tunnel, or give it a host it controls. The setup checks open the endpoint once one is there.';
-const SETUP_CHECKS_NEXT = 'the setup checks retry it';
-const ENDPOINT_NEXT = 'needs a public HTTPS URL';
+const SETUP_CHECKS_NEXT = "Verigent's checks retry it automatically";
+const ENDPOINT_NEXT = "a public HTTPS URL on the agent's side; Verigent's checks pick it up";
 
 async function cmdContinuous() {
   const handle = positional.find((a) => !a.startsWith('vgp_'));
@@ -1094,7 +1154,7 @@ async function cmdContinuous() {
 
   // ── wallet + channel: never acted on from the owner's paste — the setup checks act on the owner's answers ──
   console.log(`\n── payment · output channel ──`);
-  console.log(`${dryRun ? '[dry-run] ' : ''}Not acted on here: nothing is paid and no channel is declared. Your owner picks the rail + cap and the channel address on the setup page; the setup checks act on those.`);
+  console.log(`${dryRun ? '[dry-run] ' : ''}Not acted on here: nothing is paid and no channel is declared. Your owner picks the rail + cap and the channel address on the setup page; Verigent's setup checks act on those automatically.`);
   if (dryRun) { row('wallet', 'dry-run'); row('channel', 'dry-run'); }
   else {
     row('wallet', ...(proven('wallet') ? ['already proven'] : ['not proven', OWNER_PAGE_NEXT]));
@@ -1104,7 +1164,7 @@ async function cmdContinuous() {
   // ── summary ──
   const w = [Math.max(...rows.map((r) => r[0].length), 4), Math.max(...rows.map((r) => r[1].length), 6)];
   const line = (a, b, c) => `  ${a.padEnd(w[0])}  ${b.padEnd(w[1])}  ${c}`;
-  console.log(`\n── summary ──\n${line('step', 'result', 'next')}\n${rows.map((r) => line(...r)).join('\n')}\n\nSend the pull token only to ${SITE}. Record: ${(m && typeof m.page_url === "string" && m.page_url.startsWith(SITE)) ? m.page_url : `${SITE}/agent/${handle}`} — each proof lights up there as it lands.\n`);
+  console.log(`\n── summary ──\n${line('step', 'result', 'next')}\n${rows.map((r) => line(...r)).join('\n')}\n\nSend the pull token only to ${SITE}. Record: ${(m && typeof m.page_url === "string" && m.page_url.startsWith(SITE)) ? m.page_url : `${SITE}/agent/${handle}`} — each proof lights up there as it lands.\n${CONTINUOUS_CLOSE}\n`);
 }
 
 // ── prove pending (#39) — the AGENT runs this inside its scheduled check; the owner never sees it ──
@@ -1113,8 +1173,8 @@ async function cmdContinuous() {
 // payment for the agent's own wallet, within that cap — never pays itself); the email channel ONLY when the
 // owner saved an address (declares it; the code goes there) — the agent reports the code back once it finds
 // it in that inbox. Follow-ups are the same command with --tx / --paid / --code. Exit 0 unless auth fails.
-const PENDING_CMD = `npx -y verigent@${PKG_VERSION} prove pending`;
 async function provePending(ctx) {
+  const PENDING_CMD = pendingCmd(ctx.handle);
   const tx = String(flags.tx || '').trim();
   const code = String(flags.code || '').trim();
   if (tx) { const r = await postProof(ctx, { step: 'wallet', rail: 'sol', signature: tx }); console.log(`payment: ${resultLine(r)}`); console.log(recordLine(ctx)); process.exit(r.status === 200 ? 0 : 1); }
@@ -1197,6 +1257,8 @@ async function provePending(ctx) {
     }
   }
   if (!acted) console.log('nothing pending that this check can do.');
+  // #42: the agent relays this run to its owner — the owner never gets a Verigent command to run.
+  console.log(OWNER_PENDING_LINE);
   console.log(recordLine(ctx));
   process.exit(0);
 }
@@ -1227,15 +1289,30 @@ const PROVE_USAGE = `Usage:
   npx verigent prove pending [--tx <signature> | --code <code>]   (run by the agent inside its scheduled check)
 Reads <cwd>/.verigent/<handle>.json (written by \`npx verigent continuous\`); --handle <h> --token <vgp_token> override it.`;
 
+// What else lives in <cwd>/.verigent beside the handle files (#43): Verigent's own state — the setup-check
+// state (<handle>.setup-check.json) and its lock, the signing key, the endpoint secret, the handler script and
+// log. A HANDLE FILE is `<handle>.json` with a handle-shaped name (no inner dot — every state file has one)
+// whose content is an object carrying a pull_token string (what `continuous` writes). Nothing else counts.
+const STATE_FILE_SUFFIXES = ['.setup-check.json'];
+function listHandleFiles(dir) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((f) => f.endsWith('.json') && !STATE_FILE_SUFFIXES.some((x) => f.endsWith(x)))
+    .map((f) => f.slice(0, -5))
+    .filter((h) => SAFE_HANDLE_RE.test(h))
+    .filter((h) => { try { const j = JSON.parse(readFileSync(join(dir, `${h}.json`), 'utf8')); return !!j && typeof j === 'object' && !Array.isArray(j) && typeof j.pull_token === 'string'; } catch { return false; } })
+    .sort();
+}
 /** Which agent: --handle/--token, else the one handle file under <cwd>/.verigent (several → refuse). */
 function resolveProveContext() {
   const cwd = flags.cwd || process.cwd();
   const dir = join(cwd, '.verigent');
   let handle = String(flags.handle || '').trim();
   let token = String(flags.token || '').trim();
+  if (handle && !SAFE_HANDLE_RE.test(handle)) { console.error(`"${handle}" isn't a Verigent handle (letters, digits and hyphens, e.g. kit-0A).`); process.exit(1); }
   if (handle && token) return { handle, token, site: SITE, cwd, file: null };
   if (!handle) {
-    const handles = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)).sort() : [];
+    const handles = listHandleFiles(dir);
     if (handles.length === 0) {
       console.error(`No handle file in ${dir}: run \`npx verigent continuous <handle> --token <vgp_token>\` first (it saves one), or pass --handle <handle> --token <vgp_token>.`);
       process.exit(1);
@@ -1264,6 +1341,7 @@ async function proveReport(ctx, body) {
   try { return await postJson(`${ctx.site}/api/agent/setup-proof`, { handle: ctx.handle, pull_token: ctx.token, ...body }); }
   catch (e) { console.error(`Couldn't reach ${ctx.site}: ${e.message}. Try again in a moment.`); process.exit(1); }
 }
+const OWNER_PENDING_LINE = "For your owner: Verigent's scheduled checks finish what is left automatically; their only part is the inputs on their setup page.";
 const resultLine = (r) => `${r.data.state || (r.ok ? 'proven' : 'failed')} — ${r.data.reason || `HTTP ${r.status}`}`;
 const recordLine = (ctx) => `Record: ${ctx.site}/agent/${ctx.handle}`;
 /** Print the server's one-line result + the record link; exit 0 for a result (proven / declared / failed

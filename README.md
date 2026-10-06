@@ -61,9 +61,11 @@ setup checks then act on. Re-run it any time; a step already proven is skipped.
    a cloudflared quick tunnel and reports the tunnel URL. With neither, it reports nothing and says what
    the agent needs: a public HTTPS URL (install cloudflared, or a host it controls).
 5. **Payment proof and output channel.** Never acted on here. The summary shows each as already
-   proven, declared, or the next step on the owner's setup page.
-6. **Summary.** One table (step · result · next) and the record link. Exit 0 with steps left is the
-   normal outcome; exit 1 only when the material can't be had.
+   proven, declared, or waiting on the owner's input on the setup page — Verigent's checks finish it.
+6. **Summary.** One table (step · result · next) and the record link. The "next" column never names a
+   Verigent command: anything left is finished by Verigent's own scheduled checks, and the owner's only
+   part is the inputs on the setup page. Exit 0 with steps left is the normal outcome; exit 1 only when
+   the material can't be had.
 
 Once material and connect succeed it also saves the **handle file**, `<cwd>/.verigent/<handle>.json`
 (mode 0600):
@@ -93,17 +95,42 @@ It is bounded: at most 24 agent runs within two hours of install (on macOS the f
 minutes behind the install-time pull), then it removes itself and the normal ~5x/day schedule carries on.
 One run at a time (a lock file). The job holds no credentials.
 
-`npx verigent prove pending` is what the agent runs inside a scheduled check (every cycle prompt ends with
-it). It reads the material — including the owner's saved rail, cap and channel address — and finishes what
+`npx verigent prove pending --handle <handle>` is what the agent runs inside a scheduled check (every
+cycle prompt ends with it, always naming the handle). It is the agent's own step: the prompts tell the agent
+to report to its owner that Verigent's checks finish setup automatically, never to hand the owner a
+Verigent command. It reads the material — including the owner's saved rail, cap and channel address — and finishes what
 it can: retries the signing key and the endpoint; prints the exact payment for the agent's own wallet
 **only** when the owner saved a rail and a cap, within that cap (it never pays itself — the agent reports
-the payment with `prove pending --tx <signature>`, or re-runs it once a Lightning invoice is paid);
-declares the email channel **only** when the owner saved an address, and reports the emailed code back
-with `prove pending --code <code>`. Otherwise it says what it is waiting on.
+the payment with `prove pending --handle <h> --tx <signature>`, or re-runs it once a Lightning invoice is
+paid); declares the email channel **only** when the owner saved an address, and reports the emailed code
+back with `prove pending --handle <h> --code <code>`. Otherwise it says what it is waiting on.
 
-The scheduled jobs allow exactly `mcp__verigent` and `Bash(npx -y verigent@<this version> prove pending:*)`
-— never all of Bash. If your agent pays or reads its inbox through its own tools, allow those yourself
-with `--allow <tool,tool>`; Verigent never grants them.
+### What a scheduled run may do
+
+Both scheduled jobs run exactly `claude -p <prompt> --allowedTools <list>` from the agent's directory —
+nothing else on the command line. That means the run uses **the agent's own Claude Code permissions**:
+
+- Claude Code keeps `--allowedTools` as its own rule source beside the agent's settings files (user
+  `~/.claude/settings.json` or `$CLAUDE_CONFIG_DIR`, project `.claude/settings.json`, local
+  `.claude/settings.local.json`, and any managed policy). Allow rules from all of them are merged and deny
+  rules from any of them still win — so the list Verigent passes **adds** rules; it never replaces or
+  narrows the agent's own.
+- No `--permission-mode` is passed, so the agent's own `permissions.defaultMode` applies. Nothing that
+  narrows is ever passed (`--tools`, `--disallowedTools`, `--setting-sources`, `--settings`,
+  `--strict-mcp-config`, `--restricted`), and nothing that bypasses (`--dangerously-skip-permissions`).
+- What Verigent adds is exactly two entries: `mcp__verigent` and
+  `Bash(npx -y verigent@<this version> prove pending:*)` — never all of Bash.
+
+So an agent whose settings already allow its wallet and inbox tools can pay (within the owner's cap) and
+read the channel code inside the check with no one doing anything. A headless run has no one to answer a
+permission prompt: a tool works there only when the agent's own settings (or permission mode) allow it — a
+one-off approval given in an interactive session is not a setting and does not carry over.
+
+`--allow <tool,tool>` is optional and additive: the operator's extra rules, appended after Verigent's two.
+
+`<cwd>/.verigent` also holds Verigent's own state (the setup-check state `<handle>.setup-check.json` and its
+lock, the signing key, the endpoint secret, the handler script and log). None of these count as a handle
+file.
 
 ## Proving one step by hand — `npx verigent prove …`
 
@@ -112,7 +139,8 @@ commands. The CLI carries the explanation and does the work; every result line i
 Exit 0 on proven / declared / instructions printed; exit 1 on an auth, material or usage failure.
 
 All four read the handle file. `--handle <h>` and `--token <vgp_token>` override it; with several
-handle files in `<cwd>/.verigent` and no `--handle`, the command refuses and lists them. `--cwd <dir>`
+handle files in `<cwd>/.verigent` and no `--handle`, the command refuses and lists them. A handle file is
+`<handle>.json` holding a `pull_token`; Verigent's state files in the same folder are never counted. `--cwd <dir>`
 points at another agent directory.
 
 ### `npx verigent prove key [--key <ed25519 pem>]`
