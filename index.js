@@ -27,6 +27,7 @@
 import { spawnSync, spawn, execSync } from 'node:child_process';
 import { createHmac, timingSafeEqual, generateKeyPairSync, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { createServer } from 'node:http';
+import { get as httpsGet } from 'node:https';
 import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, chmodSync, readdirSync, openSync, closeSync, statSync, utimesSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, basename, dirname } from 'node:path';
@@ -638,15 +639,23 @@ function setupPlan(m, { cwd, handle, channelSelfAsks = 0 } = {}) {
   if (!connected) acts.push('first check');
   if (s.identity === 'pending') acts.push('signing key');
   if (endpointCan) acts.push('endpoint');
-  if (s.wallet === 'pending' && inp.rail && inp.cap) acts.push('payment');
+  // #56 (Q-AA): a verified setup payment of this agent's on record → the run re-proves from it, no rail/cap needed.
+  const walletCan = s.wallet === 'pending' && (!!(m && m.wallet_on_record) || !!(inp.rail && inp.cap));
+  if (walletCan) acts.push('payment');
   const selfChannel = s.channel === 'pending' && !isEmail(inp.channel) && channelSelfAsks < CHANNEL_SELF_ASKS;
   if ((s.channel === 'pending' && isEmail(inp.channel)) || (s.channel === 'declared' && !!ch.email)) acts.push('output channel');
   else if (selfChannel) acts.push('output channel (its own inbox)');
   const waits = [];
   if (s.endpoint === 'pending' && !endpointCan) waits.push('a public URL for the endpoint');
-  if (s.wallet === 'pending' && !(inp.rail && inp.cap)) waits.push('a rail + cap on the setup page');
+  if (s.wallet === 'pending' && !walletCan) waits.push('a rail + cap on the setup page');
   if (s.channel === 'pending' && !isEmail(inp.channel) && !selfChannel) waits.push('an email address on the setup page');
-  return { connected, settled: connected && done('identity') && done('endpoint') && done('wallet') && !channelOpen, acts, waits, selfChannel };
+  // #58: the steps this run works on — the owner's page shows "Checking" on exactly these rows while it runs.
+  const checking = [];
+  if (s.identity === 'pending') checking.push('identity');
+  if (endpointCan) checking.push('endpoint');
+  if (walletCan) checking.push('wallet');
+  if (acts.some((a) => a.startsWith('output channel'))) checking.push('channel');
+  return { connected, settled: connected && done('identity') && done('endpoint') && done('wallet') && !channelOpen, acts, waits, selfChannel, checking };
 }
 
 function installSetupCheck({ handle, cwd, claudeBin, allowed, extraEnv, npxBin }) {
@@ -864,12 +873,17 @@ async function cmdSetupCheck() {
   count({ last_result: 'run', ...(plan.selfChannel ? { channel_self_asks: selfAsks + 1 } : {}) });
   log(`to do: ${plan.acts.join(' · ')} — agent run ${tries + 1} of ${maxTries}${plan.connected ? ' (setup only)' : ''}.`);
   const prompt = plan.connected ? setupPrompt(handle) : cyclePrompt(handle);
+  // #58: tell Verigent which steps this run works on, so the owner's page shows "Checking" on those rows
+  // (best-effort — a miss only means the rows don't spin; the proofs still land).
+  if (plan.checking.length) { try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, checking: plan.checking }); } catch { /* best-effort */ } }
   const extras = Array.isArray(st.allow_extra) ? st.allow_extra : legacyExtras(st.allowed);
   const res = spawnSync(st.claude_bin || 'claude', ['-p', prompt, '--allowedTools', scheduledAllowed(extras)], { cwd, stdio: 'inherit', timeout: SETUP_CHECK_RUN_TIMEOUT_MS });
   release();
   log(`run ended (exit ${res.status ?? res.signal ?? (res.error && res.error.code) ?? '?'}); the next tick asks Verigent again.`);
   // #47 b: the run took a while — say when the next tick is from NOW (best-effort; a miss changes nothing).
-  try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, next_check_at: nextCheckAt(cwd, handle) }); } catch { /* the next tick reports again */ }
+  // #58: the run is over — Verigent clears the rows' "Checking" and, for a payment / channel the run left
+  // unproven without saying why, shows that it ended without one (never a proof).
+  try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, next_check_at: nextCheckAt(cwd, handle), run_ended: true, checking: [] }); } catch { /* the next tick reports again */ }
   process.exit(0);
 }
 
@@ -1237,6 +1251,15 @@ async function attemptEndpoint(ctx, { port, publicUrl = '', getSecret }) {
   } else {
     console.log(`Handler already up on :${port}${publicUrl ? '' : ` behind ${url}`} — left running.`);
   }
+  // #55: a quick tunnel answers 30–60 s after it prints its URL — wait (bounded) until it reaches the handler.
+  if (!publicUrl) {
+    console.log(`Waiting for ${url} to answer from outside (a new quick tunnel takes up to a minute)…`);
+    const t0 = Date.now();
+    if (!(await waitFor(() => publicUrlAnswers(url), TUNNEL_ANSWER_MS, 3000))) {
+      return { error: `The quick tunnel ${url} didn't reach the handler within ${Math.round(TUNNEL_ANSWER_MS / 1000)} s — not reported; the next setup check tries again (log: ${logPath}).` };
+    }
+    console.log(`It answers (after ${Math.round((Date.now() - t0) / 1000)} s).`);
+  }
   console.log(`Reporting ${url} …`);
   const r = await postProof(ctx, { step: 'endpoint', url });
   if (r.status === 200 && r.data.state === 'proven') writeHandleFile(ctx.cwd, ctx.handle, { endpoint_url: url });
@@ -1355,6 +1378,10 @@ async function cmdContinuous() {
   console.log(`\n── summary ──\n${line('step', 'result', 'next')}\n${rows.map((r) => line(...r)).join('\n')}\n\nSend the pull token only to ${SITE}. Record: ${(m && typeof m.page_url === "string" && m.page_url.startsWith(SITE)) ? m.page_url : `${SITE}/agent/${handle}`} — each proof lights up there as it lands.\n${CONTINUOUS_CLOSE}\n`);
 }
 
+// #58 follow-up: how the agent says it won't do a step this run (its owner sees the reason on the setup page).
+const DECLINE_STEPS = { payment: 'wallet', wallet: 'wallet', channel: 'channel', inbox: 'channel', 'output-channel': 'channel' };
+const declineLine = (cmd, what) => `If you decide not to ${what === 'payment' ? 'pay' : 'read that inbox'} this time, say why in one line so your owner sees it:\n  ${cmd} --declined ${what} --reason "<why, in your words>"`;
+
 // ── prove pending (#39) — the AGENT runs this inside its scheduled check; the owner never sees it ──
 // Reads setup-material (incl. the owner's saved rail · cap · channel) and finishes what it can: the signing
 // key and the endpoint are retried; the payment ONLY when the owner saved a rail + cap (it prints the exact
@@ -1368,6 +1395,17 @@ async function provePending(ctx) {
   const code = String(flags.code || '').trim();
   if (tx) { const r = await postProof(ctx, { step: 'wallet', rail: 'sol', signature: tx }); console.log(`payment: ${resultLine(r)}`); console.log(recordLine(ctx)); process.exit(r.status === 200 ? 0 : 1); }
   if (code) { const r = await postProof(ctx, { step: 'channel', code }); console.log(`output channel: ${resultLine(r)}`); console.log(recordLine(ctx)); process.exit(r.status === 200 ? 0 : 1); }
+  // #58 follow-up: the agent decided NOT to do a step this run — say so, in one line, so the owner's page shows
+  // why instead of "Checking". Never a proof; the reason is shown to the owner as plain text.
+  if (flags.declined !== undefined) {
+    const which = DECLINE_STEPS[String(flags.declined || '').trim().toLowerCase()];
+    const why = String(flags.reason || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    if (!which || !why) { console.error('Usage: --declined payment|channel --reason "<one line: why not, in your words>"'); process.exit(1); }
+    const r = await postProof(ctx, { step: 'decline', for: which, reason: why });
+    console.log(`${which === 'wallet' ? 'payment' : 'output channel'}: ${r.status === 200 ? 'your owner sees why on the setup page.' : resultLine(r)}`);
+    console.log(recordLine(ctx));
+    process.exit(r.status === 200 ? 0 : 1);
+  }
   // #53: the agent declares the inbox it reads as its own output channel — the same declaration (and the same
   // code email) as an address the owner typed on the page.
   const selfEmail = String(flags.email || '').trim();
@@ -1413,7 +1451,17 @@ async function provePending(ctx) {
       console.log(`endpoint: ${NEEDS_PUBLIC_URL}`);
     }
   }
-  if (s.wallet === 'pending') {
+  // #56 (Q-AA, Ant 2026-10-07 07:03): a payment this agent ALREADY made, verified by Verigent and still on
+  // record, proves the step again — checked FIRST, so a check never asks for a new payment the server would
+  // not need. The server looks it up by this agent alone; nothing is claimed here.
+  let walletReused = false;
+  if (s.wallet === 'pending' && m.wallet_on_record) {
+    acted = true;
+    const r = await postProof(ctx, { step: 'wallet', reuse: true });
+    walletReused = r.status === 200 && r.data.state === 'proven';
+    console.log(`payment: ${walletReused ? `no new payment — ${r.data.reason || 'proven from your earlier verified payment.'}` : resultLine(r)}`);
+  }
+  if (s.wallet === 'pending' && !walletReused) {
     if (!inp.rail || !inp.cap) {
       console.log('payment: waiting for your owner to choose a rail and a cap on the setup page — nothing to do now.');
     } else if (inp.rail === 'sol') {
@@ -1427,6 +1475,7 @@ async function provePending(ctx) {
         console.log(SOL_INDEX_LAG);
         console.log('If you already made this payment, report its signature instead of paying again.');
         console.log(`${STANDING_PERMISSION} Only pay within that cap, from a wallet you control.`);
+        console.log(declineLine(PENDING_CMD, 'payment'));
       }
     } else {
       acted = true;
@@ -1441,6 +1490,7 @@ async function provePending(ctx) {
         console.log(`  ${invoice}`);
         console.log(`${STANDING_PERMISSION} Only pay within that cap, from a wallet you control.`);
         console.log(`Then run \`${PENDING_CMD}\` again once paid.`);
+        console.log(declineLine(PENDING_CMD, 'payment'));
       }
     }
   }
@@ -1449,6 +1499,7 @@ async function provePending(ctx) {
     acted = true;
     console.log(`output channel: a code went to ${ch.email}. Find Verigent's email with the code for this agent's output channel in that inbox, then run:`);
     console.log(`  ${PENDING_CMD} --code <code>`);
+    console.log(declineLine(PENDING_CMD, 'channel'));
   } else if (s.channel === 'pending' || (s.channel === 'declared' && ch.email)) {
     const email = isEmail(inp.channel) ? bareEmail(inp.channel) : (ch.email || '');
     if (!email) {
@@ -1466,6 +1517,7 @@ async function provePending(ctx) {
       if (r.data.pending_code) {
         console.log(`A code is on its way to ${email}. Find it in that inbox, then run:`);
         console.log(`  ${PENDING_CMD} --code <code>`);
+        console.log(declineLine(PENDING_CMD, 'channel'));
       }
     }
   }
@@ -1499,7 +1551,7 @@ const PROVE_USAGE = `Usage:
   ${PROVE_ENDPOINT_CMD} [--public-url <https url>] [--port 8787] [--cwd <agent dir>]
   ${PROVE_WALLET_SOL_CMD} | ${PROVE_WALLET_LN_CMD}  [--cap "<text>"] [--tx <signature>]
   ${PROVE_CHANNEL_CMD} | --channel "<text>" | --code <code>
-  npx verigent prove pending [--tx <signature> | --code <code>]   (run by the agent inside its scheduled check)
+  npx verigent prove pending [--tx <signature> | --code <code> | --declined payment|channel --reason "<why>"]   (run by the agent inside its scheduled check)
 Reads <cwd>/.verigent/<handle>.json (written by \`npx verigent continuous\`); --handle <h> --token <vgp_token> override it.`;
 
 // What else lives in <cwd>/.verigent beside the handle files (#43): Verigent's own state — the setup-check
@@ -1596,6 +1648,48 @@ const tunnelUrl = (logPath) => {
   return m ? m[m.length - 1] : null;
 };
 const WAIT_MS = 60000;
+
+// #55 (Kit walk S1, 2026-10-07): a cloudflared quick tunnel prints its URL ~30–60 s before that URL answers —
+// reporting it at once got Verigent a 530 on the first check. So before a tunnel URL is reported, the CLI
+// GETs it the way Verigent will (from outside, through the public hostname) until the handler answers —
+// bounded by TUNNEL_ANSWER_MS. The hostname is resolved through Cloudflare's DNS-over-HTTPS, not this
+// machine's resolver: a lookup made before the brand-new name existed is cached as "no such host" by the
+// local resolver and would keep failing long after the tunnel is up. (VERIGENT_TUNNEL_WAIT_MS: tests only.)
+const TUNNEL_ANSWER_MS = (() => { const v = Number(process.env.VERIGENT_TUNNEL_WAIT_MS); return Number.isFinite(v) && v >= 100 && v <= 300_000 ? v : 90_000; })();
+const HANDLER_UP_RE = /verigent handler up/;
+async function dohA(host) {
+  try {
+    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`, { headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(4000) });
+    const j = await r.json();
+    const a = Array.isArray(j && j.Answer) ? j.Answer.find((x) => x && x.type === 1 && /^\d{1,3}(\.\d{1,3}){3}$/.test(String(x.data))) : null;
+    return a ? String(a.data) : null;
+  } catch { return null; }
+}
+/** GET <url>/ pinned to `ip` (TLS + Host still name the real hostname). → true when the handler answers. */
+function getPinned(url, ip) {
+  return new Promise((res) => {
+    const req = httpsGet(url, { lookup: (_h, opts, cb) => (opts && opts.all ? cb(null, [{ address: ip, family: 4 }]) : cb(null, ip, 4)), timeout: 5000 }, (r) => {
+      let body = '';
+      r.setEncoding('utf8');
+      r.on('data', (c) => { if (body.length < 4096) body += c; });
+      r.on('end', () => res(r.statusCode === 200 && HANDLER_UP_RE.test(body)));
+      r.on('error', () => res(false));
+    });
+    req.on('timeout', () => { req.destroy(); res(false); });
+    req.on('error', () => res(false));
+  });
+}
+/** Does the public URL reach the handler right now? */
+async function publicUrlAnswers(url) {
+  let host = '';
+  try { host = new URL(url).hostname; } catch { return false; }
+  const ip = await dohA(host);
+  if (ip) return getPinned(`${url.replace(/\/$/, '')}/`, ip);
+  try {
+    const r = await fetch(`${url.replace(/\/$/, '')}/`, { signal: AbortSignal.timeout(5000) });
+    return r.ok && HANDLER_UP_RE.test(await r.text());
+  } catch { return false; }
+}
 
 /** Install (or replace) the persistent handler job: a readable shell script under <cwd>/.verigent, run by
  *  launchd (macOS, KeepAlive) or started now + `@reboot` in crontab (elsewhere). The script holds no

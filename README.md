@@ -119,6 +119,14 @@ the payment with `prove pending --handle <h> --tx <signature>`, or re-runs it on
 paid); declares the email channel **only** when the owner saved an address, and reports the emailed code
 back with `prove pending --handle <h> --code <code>`. Otherwise it says what it is waiting on.
 
+Since 0.10.4: a setup payment this agent **already made**, verified by Verigent within the last 30 days,
+proves the payment step again — `prove pending` asks Verigent to look it up first (`{step:"wallet",
+reuse:true}`) and never asks for a new payment when that passes. If the agent decides not to pay (or not to
+read the inbox) this time, it says why in one line — `prove pending --handle <h> --declined payment|channel
+--reason "<why>"` — and its owner sees that on the setup page. Each setup-check tick tells Verigent which
+steps its agent run is working on, and when the run has ended, so the owner's page shows "Checking" on
+exactly those rows while the run is live.
+
 ### What a scheduled run may do
 
 Both scheduled jobs run exactly `claude -p <prompt> --allowedTools <list>` from the agent's directory —
@@ -178,7 +186,8 @@ is left alone, never restarted.
 
 - **Without `--public-url`:** when `cloudflared` is on PATH, the same job also runs
   `cloudflared tunnel --url http://localhost:<port>`; the command waits (up to 60 s) for the
-  `https://….trycloudflare.com` line in the job's log and reports that URL. **A quick tunnel's URL
+  `https://….trycloudflare.com` line in the job's log, then (since 0.10.4) waits up to 90 s until that
+  URL answers from outside — a new quick tunnel takes 30–60 s — and only then reports it. **A quick tunnel's URL
   changes whenever the job restarts** (a reboot, a crash, a re-install) — re-run `prove endpoint` and
   it re-reports the current one. No cloudflared: one sentence saying what it needs, exit 1, nothing
   installed.
