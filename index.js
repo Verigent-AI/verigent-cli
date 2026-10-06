@@ -27,7 +27,7 @@
 import { spawnSync, spawn, execSync } from 'node:child_process';
 import { createHmac, generateKeyPairSync, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { createServer } from 'node:http';
-import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, chmodSync, readdirSync, openSync, closeSync, statSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, chmodSync, readdirSync, openSync, closeSync, statSync, utimesSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -504,7 +504,7 @@ function cmdSchedule() {
   <dict>${extraEnv.map(([k, v]) => `
     <key>${esc(k)}</key><string>${esc(v)}</string>`).join('')}
   </dict>` : ''}
-  <key>StartInterval</key><integer>17280</integer>
+  <key>StartInterval</key><integer>${PULL_EVERY_S}</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>${esc(join(cwd, '.verigent-pull.log'))}</string>
   <key>StandardErrorPath</key><string>${esc(join(cwd, '.verigent-pull.err'))}</string>
@@ -565,12 +565,25 @@ Testing starts at the agent's first check; the report reads Current from there. 
 // refused (no standing grant yet, #34) or fails, or a setup proof the owner unlocks on the page a minute
 // later (a rail + cap, an email address), used to wait ~5 hours. While SETUP is unsettled, a second,
 // short-lived job checks every 5 minutes:
-//   • label ai.verigent.setupcheck.<handle>; launchd StartInterval 300 (RunAtLoad off — the pull job's own
-//     RunAtLoad already fired) or a `*/5` crontab line; it runs `npx -y verigent@<this> setup-check <handle>`.
+//   • label ai.verigent.setupcheck.<handle>; launchd StartInterval 300 + RunAtLoad (its first tick fires at
+//     install) or a `*/5` crontab line; it runs `npx -y verigent@<this> setup-check <handle>`.
+//   • STARTS AS SOON AS THE INSTALL-TIME CHECK HAS FINISHED (#47, Ant 2026-10-07 Q-U — replaces the fixed
+//     10-minute hold of 0.10.1). Never on top of it: two agent sessions at once caused a refusal (#44). The
+//     source of truth is the scheduler that runs the pull job — launchd (`launchctl print` of
+//     ai.verigent.pull.<handle>: `state = running`, or `runs = 0` in the first minute after install = about to
+//     fire) or, on Linux, the process table (a `claude -p` whose prompt is this handle's cycle). Not the
+//     server's connected flag (a refused or failed first check never flips it, and it can't say "still
+//     running"), not a file the pull writes (the pull job is `claude -p` itself — it writes none). A tick that
+//     finds the pull running HOLDS the lock and waits inside the tick (polling every
+//     SETUP_CHECK_PULL_POLL_MS, at most SETUP_CHECK_PULL_WAIT_MS), then goes the moment it has finished — so
+//     the first setup check follows the install-time check with no fixed gap, and the 5-minute cadence after
+//     that is unchanged (launchd never starts a job a second time while it is running).
 //   • BOUNDED by a 0600 state file <cwd>/.verigent/<handle>.setup-check.json written at install: at most
-//     SETUP_CHECK_MAX_TRIES agent runs inside SETUP_CHECK_WINDOW_MS (macOS holds the first try back
-//     SETUP_CHECK_HOLD_MS so it never races the RunAtLoad pull). No state file, cap reached or window over →
-//     the job removes itself and the normal ~5x/day schedule carries on. It can't loop forever.
+//     SETUP_CHECK_MAX_TRIES agent runs inside SETUP_CHECK_WINDOW_MS. No state file, cap reached or window over
+//     → the job removes itself and the normal ~5x/day schedule carries on. It can't loop forever.
+//   • REPORTS WHEN THE AGENT'S NEXT CHECK IS DUE (#47 b): every tick's setup-material call carries
+//     `next_check_at` (the next tick), and so does the one after an agent run; `prove pending` (the end of
+//     every pull) carries it too (nextCheckAt). The owner's open setup step shows it; unknown → nothing.
 //   • ASKS FIRST, every tick: POST setup-material (read-only; the pull token from the 0600 handle file
 //     `continuous` saved). Settled (a check has landed AND every proof is proven / skipped / a declared
 //     non-email channel) → the job removes itself without running anything. Something the AGENT can act on
@@ -582,12 +595,21 @@ Testing starts at the agent's first check; the report reads Current from there. 
 //     already connected → setupPrompt only (`prove pending`, no probe), so a settled check is never re-bought.
 //   • Its permissions are the pull job's: the agent's own settings + Verigent's two entries (+ the operator's
 //     optional --allow extras) — see THE SCHEDULED RUNS' PERMISSIONS above.
-//   • One run at a time (a lock file, stale after 30 minutes) — cron would otherwise overlap a slow one.
+//   • One run at a time (a lock file, stale after 30 minutes, touched while a tick waits on the pull) — cron
+//     would otherwise overlap a slow one.
 // The job holds NO credentials (§5f): the state file names the claude binary and the allowed tools only.
 const SETUP_CHECK_EVERY_S = 300;
+// The pull job's launchd period (4h48m = 5x/day); the Linux crontab line runs at :13 past these local hours.
+const PULL_EVERY_S = 17280;
+const PULL_CRON_HOURS = [1, 6, 11, 16, 21];
+const PULL_CRON_MINUTE = 13;
 const SETUP_CHECK_MAX_TRIES = 24;
 const SETUP_CHECK_WINDOW_MS = 2 * 60 * 60 * 1000;
-const SETUP_CHECK_HOLD_MS = 10 * 60 * 1000;
+// #47: how long one tick waits for a running pull job (inside the lock), how often it looks, and how long
+// after install a pull job launchd has not started yet counts as "about to fire" (RunAtLoad).
+const SETUP_CHECK_PULL_WAIT_MS = 25 * 60 * 1000;
+const SETUP_CHECK_PULL_POLL_MS = (() => { const v = Number(process.env.VERIGENT_SETUP_POLL_MS); return Number.isFinite(v) && v >= 10 && v <= 15_000 ? v : 15_000; })();
+const SETUP_CHECK_PULL_START_GRACE_MS = 60 * 1000;
 const SETUP_CHECK_LOCK_STALE_MS = 30 * 60 * 1000;
 const SETUP_CHECK_RUN_TIMEOUT_MS = 20 * 60 * 1000;
 const setupCheckStatePath = (cwd, handle) => join(cwd, '.verigent', `${handle}.setup-check.json`);
@@ -622,9 +644,9 @@ function setupPlan(m, { cwd, handle } = {}) {
 function installSetupCheck({ handle, cwd, claudeBin, allowed, extraEnv, npxBin }) {
   const label = jobLabel('setupcheck', handle);
   const now = Date.now();
-  const notBefore = now + (process.platform === 'darwin' ? SETUP_CHECK_HOLD_MS : 0);
+  // #47: no `not_before` — each tick waits for the install-time pull to FINISH instead (pullJobRunning).
   const state = {
-    handle, installed_at: new Date(now).toISOString(), not_before: notBefore, until: now + SETUP_CHECK_WINDOW_MS,
+    handle, installed_at: new Date(now).toISOString(), until: now + SETUP_CHECK_WINDOW_MS,
     tries: 0, max_tries: SETUP_CHECK_MAX_TRIES, every_s: SETUP_CHECK_EVERY_S, claude_bin: claudeBin,
     // `allowed` is a record of what was installed; the tick REBUILDS the list from Verigent's two entries + the
     // operator's `allow_extra` (#46), so Verigent's own two always match the running version.
@@ -652,7 +674,8 @@ function installSetupCheck({ handle, cwd, claudeBin, allowed, extraEnv, npxBin }
     <key>${esc(k)}</key><string>${esc(v)}</string>`).join('')}
   </dict>` : ''}
   <key>StartInterval</key><integer>${SETUP_CHECK_EVERY_S}</integer>
-  <key>RunAtLoad</key><false/>
+  <!-- #47: the first tick fires at install and waits for the install-time pull to finish, then runs. -->
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>${esc(join(cwd, '.verigent-pull.log'))}</string>
   <key>StandardErrorPath</key><string>${esc(join(cwd, '.verigent-pull.err'))}</string>
 </dict>
@@ -709,6 +732,59 @@ function removeSetupCheckJob(handle, cwd, { quiet = false } = {}) {
   }
 }
 
+/** #47: is this handle's PULL job running right now (or about to fire at install)? The scheduler is the
+ *  source of truth — see SETUP CHECKS above. 'running' | 'starting' | 'idle'. Never throws: anything it can't
+ *  read is 'idle' (a missing pull job can't overlap anything). */
+function pullJobRunning(handle, st, now = Date.now()) {
+  try {
+    if (process.platform === 'darwin') {
+      const r = run('launchctl', ['print', `gui/${process.getuid()}/${jobLabel('pull', handle)}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const out = String((r && r.stdout) || '');
+      if (/\bstate = running\b/.test(out)) return 'running';
+      // RunAtLoad not fired yet: launchd has the job but has never run it, and we are in the first minute.
+      const installed = st ? Date.parse(st.installed_at) : NaN;
+      if (/\bruns = 0\b/.test(out) && Number.isFinite(installed) && now - installed < SETUP_CHECK_PULL_START_GRACE_MS) return 'starting';
+      return 'idle';
+    }
+    if (process.platform === 'linux') {
+      const r = run('ps', ['-eo', 'args='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const marker = `prove pending --handle ${handle}\``;
+      const busy = String((r && r.stdout) || '').split('\n').some((l) => /(^|\/)claude\s+-p\s/.test(l) && l.includes('Run one Verigent verification cycle') && l.includes(marker));
+      return busy ? 'running' : 'idle';
+    }
+  } catch { /* unreadable → idle */ }
+  return 'idle';
+}
+
+/** #47 b: when this agent's NEXT scheduled check is due, as an ISO instant — or null when it isn't known.
+ *  While the setup-check job is live: its next tick. After it: the pull job's next run (launchd: every
+ *  PULL_EVERY_S from the install the state file recorded; Linux: the crontab's fixed local times). */
+function nextCheckAt(cwd, handle, now = Date.now()) {
+  const st = readSetupCheckState(cwd, handle);
+  if (st && !st.done) {
+    const maxTries = Math.min(Number(st.max_tries) || SETUP_CHECK_MAX_TRIES, SETUP_CHECK_MAX_TRIES);
+    if ((Number(st.tries) || 0) < maxTries && now < Number(st.until)) return new Date(now + SETUP_CHECK_EVERY_S * 1000).toISOString();
+  }
+  if (process.platform === 'linux') {
+    const d = new Date(now);
+    for (let day = 0; day < 2; day++) {
+      for (const h of PULL_CRON_HOURS) {
+        const t = new Date(d.getFullYear(), d.getMonth(), d.getDate() + day, h, PULL_CRON_MINUTE, 0, 0).getTime();
+        if (t > now) return new Date(t).toISOString();
+      }
+    }
+    return null;
+  }
+  if (process.platform === 'darwin' && st) {
+    const base = Date.parse(st.installed_at);
+    if (!Number.isFinite(base)) return null;
+    const period = PULL_EVERY_S * 1000;
+    return new Date(base + Math.max(1, Math.ceil((now - base) / period)) * period).toISOString();
+  }
+  return null;
+}
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /** One tick of the setup-check job. Every exit is 0: a finished job removes itself; nothing here retries
  *  inside a tick (the next tick is the retry). */
 async function cmdSetupCheck() {
@@ -730,8 +806,6 @@ async function cmdSetupCheck() {
   const tries = Number(st.tries) || 0;
   if (tries >= maxTries) finish(`cap reached (${tries} runs)`);
   if (!(now <= Number(st.until)) || Number(st.until) - Date.parse(st.installed_at) > SETUP_CHECK_WINDOW_MS) finish('window over');
-  if (now < Number(st.not_before)) { log('holding — the install-time pull is still on its first try.'); process.exit(0); }
-
   const lockPath = `${setupCheckStatePath(cwd, handle)}.lock`;
   try {
     const fd = openSync(lockPath, 'wx'); closeSync(fd);
@@ -743,10 +817,27 @@ async function cmdSetupCheck() {
   const release = () => { try { unlinkSync(lockPath); } catch { /* already gone */ } };
   const count = (extra = {}) => writeSetupCheckState(cwd, handle, { ...st, tries: tries + 1, last_try_at: new Date().toISOString(), ...extra });
 
+  // #47: never on top of the pull job (the install-time check, or any scheduled pull) — wait for it to FINISH,
+  // holding the lock (touched each look, so it never goes stale), then go at once. Bounded: still running
+  // after SETUP_CHECK_PULL_WAIT_MS → this tick ends uncounted and the next one looks again.
+  if (pullJobRunning(handle, st) !== 'idle') {
+    log("the agent's scheduled check is running — waiting for it to finish.");
+    const waitUntil = Date.now() + SETUP_CHECK_PULL_WAIT_MS;
+    let busy = true;
+    while (Date.now() < waitUntil) {
+      await sleepMs(SETUP_CHECK_PULL_POLL_MS);
+      try { const t = new Date(); utimesSync(lockPath, t, t); } catch { /* gone — carry on */ }
+      if (pullJobRunning(handle, st) === 'idle') { busy = false; break; }
+    }
+    if (busy) { release(); log('the scheduled check is still running — no run this tick.'); process.exit(0); }
+    log('the scheduled check has finished — checking setup now.');
+  }
+
   const token = String(readHandleFile(cwd, handle).pull_token || '').trim();
   if (!token) { release(); finish('no pull token in the handle file'); }
   let r;
-  try { r = await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token }); }
+  // #47 b: every tick tells Verigent when the agent's next check is due (the next tick) — the owner's page shows it.
+  try { r = await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, next_check_at: nextCheckAt(cwd, handle) }); }
   catch (e) { count({ last_result: 'unreachable' }); release(); log(`couldn't reach ${SITE} (${e.message}) — no run this tick.`); process.exit(0); }
   if (r.status === 401) { release(); finish('the pull token was refused'); }
   if (!r.ok || !r.data || !r.data.ok) {
@@ -768,6 +859,8 @@ async function cmdSetupCheck() {
   const res = spawnSync(st.claude_bin || 'claude', ['-p', prompt, '--allowedTools', scheduledAllowed(extras)], { cwd, stdio: 'inherit', timeout: SETUP_CHECK_RUN_TIMEOUT_MS });
   release();
   log(`run ended (exit ${res.status ?? res.signal ?? (res.error && res.error.code) ?? '?'}); the next tick asks Verigent again.`);
+  // #47 b: the run took a while — say when the next tick is from NOW (best-effort; a miss changes nothing).
+  try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, next_check_at: nextCheckAt(cwd, handle) }); } catch { /* the next tick reports again */ }
   process.exit(0);
 }
 
@@ -924,10 +1017,10 @@ async function postJson(url, body) {
 
 /** POST setup-material (read-only). Exits 1 — one plain line — when it can't be had. Shared by
  *  `continuous` and `prove`. */
-async function fetchMaterial(site, handle, token) {
+async function fetchMaterial(site, handle, token, extra = null) {
   const auth = { handle, pull_token: token };
   let r;
-  try { r = await postJson(`${site}/api/agent/setup-material`, auth); }
+  try { r = await postJson(`${site}/api/agent/setup-material`, extra ? { ...auth, ...extra } : auth); }
   catch (e) { console.error(`Couldn't reach ${site}: ${e.message}. Try again in a moment.`); process.exit(1); }
   if (r.status === 409 && r.data.reason === 'setup_not_issued') {
     console.error(`Setup for ${handle} hasn't been issued yet: your owner opens Set up on the report page (${site}/agent/${handle}) first, then this command has the material it needs.`);
@@ -1179,7 +1272,9 @@ async function provePending(ctx) {
   const code = String(flags.code || '').trim();
   if (tx) { const r = await postProof(ctx, { step: 'wallet', rail: 'sol', signature: tx }); console.log(`payment: ${resultLine(r)}`); console.log(recordLine(ctx)); process.exit(r.status === 200 ? 0 : 1); }
   if (code) { const r = await postProof(ctx, { step: 'channel', code }); console.log(`output channel: ${resultLine(r)}`); console.log(recordLine(ctx)); process.exit(r.status === 200 ? 0 : 1); }
-  const m = await fetchMaterial(ctx.site, ctx.handle, ctx.token);
+  // #47 b: every pull ends here — tell Verigent when this agent's next check is due (omitted when unknown).
+  const next = nextCheckAt(ctx.cwd, ctx.handle);
+  const m = await fetchMaterial(ctx.site, ctx.handle, ctx.token, next ? { next_check_at: next } : null);
   const s = m.steps || {};
   const inp = m.owner_inputs || {};
   const ch = m.channel || {};

@@ -91,9 +91,16 @@ While setup is unsettled, a short-lived job (launchd `StartInterval` 300, or a `
   setup-only run of `prove pending`;
 - only owner-side answers missing → no run this tick (not counted).
 
-It is bounded: at most 24 agent runs within two hours of install (on macOS the first try waits ten
-minutes behind the install-time pull), then it removes itself and the normal ~5x/day schedule carries on.
-One run at a time (a lock file). The job holds no credentials.
+It never runs on top of the agent's scheduled check: a tick that finds the pull job running (launchd's
+own record of `ai.verigent.pull.<handle>` on macOS — its first tick fires at install; the process table on
+Linux) waits for it to finish, then goes at once. So the first setup check follows the install-time check
+with no fixed gap, and the 5-minute cadence after that is unchanged.
+
+Every tick, the run after it, and every `prove pending` tell Verigent when the agent's next check is due
+(`next_check_at`); the owner's setup page shows it on the open step.
+
+It is bounded: at most 24 agent runs within two hours of install, then it removes itself and the normal
+~5x/day schedule carries on. One run at a time (a lock file). The job holds no credentials.
 
 `npx verigent prove pending --handle <handle>` is what the agent runs inside a scheduled check (every
 cycle prompt ends with it, always naming the handle). It is the agent's own step: the prompts tell the agent
