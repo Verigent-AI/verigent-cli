@@ -127,10 +127,17 @@ read the inbox) this time, it says why in one line — `prove pending --handle <
 steps its agent run is working on, and when the run has ended, so the owner's page shows "Checking" on
 exactly those rows while the run is live.
 
+Since 0.10.5: the **pull job** (the install-time check and every scheduled one) reports its runs the same
+way. The job runs `npx -y verigent@<this version> pull-run <handle> --cwd <dir> -- <the agent's command>`:
+before the agent's command it tells Verigent which rows the run works on (Connect while no check has landed
+yet, plus each unproven step `prove pending` will attempt), and after it, that the run ended. The reports
+are best-effort and time-bounded — no handle file, Verigent unreachable or a refusal never stops or fails
+the check, and the job exits with the agent command's own exit code.
+
 ### What a scheduled run may do
 
 Both scheduled jobs run exactly `claude -p <prompt> --allowedTools <list>` from the agent's directory —
-nothing else on the command line. That means the run uses **the agent's own Claude Code permissions**:
+nothing else on the command line (the pull job passes it through `pull-run` untouched). That means the run uses **the agent's own Claude Code permissions**:
 
 - Claude Code keeps `--allowedTools` as its own rule source beside the agent's settings files (user
   `~/.claude/settings.json` or `$CLAUDE_CONFIG_DIR`, project `.claude/settings.json`, local

@@ -14,6 +14,9 @@
 //   npx verigent schedule <handle>       install the ~5x/day challenge-pull job (launchd/cron)
 //   npx verigent handler                 run the sovereignty challenge endpoint (HMAC responder)
 //   npx verigent setup-check <handle>    the setup-check job's one tick (installed by `continuous`; see SETUP CHECKS)
+//   npx verigent pull-run <handle> -- <claude -p …>
+//                                        the pull job's wrapper (installed by `schedule`; see PULL RUN): reports
+//                                        run start / end to Verigent around the agent's scheduled check
 //   npx verigent prove pending --handle <h>
 //                                        run BY THE AGENT inside a scheduled check: finishes the setup proofs
 //                                        the owner's page unlocked (key, endpoint, payment within the cap, channel)
@@ -130,7 +133,7 @@ const argv = process.argv.slice(2);
 // advertises — while `npx verigent <handle> <vgp_token>` (positional creds, no keyword) stays the
 // paid setup form. Before 2026-09-04 the no-keyword default was 'setup', so bare `npx verigent`
 // fell through to a usage screen instead of actually sitting the test (site⇄CLI drift, Kit cold run).
-const KNOWN_CMDS = ['schedule', 'handler', 'setup', 'free', 'register', 'help', 'prove', 'setup-check', 'continuous'];
+const KNOWN_CMDS = ['schedule', 'handler', 'setup', 'free', 'register', 'help', 'prove', 'setup-check', 'continuous', 'pull-run'];
 // Personal COMP CODE (Ant 2026-09-06, VG-115): `npx verigent <code>` — the bare second argument IS the
 // code (their name, e.g. `deshraj`), no flags, no prefix. Shape mirrors COMP_CODE_RE in
 // functions/lib/comp-ladder.ts (this package can't import it; a repo test asserts they match). A single
@@ -152,7 +155,10 @@ if (argv[0] && !argv[0].startsWith('-') && KNOWN_CMDS.includes(argv[0])) {
 const dryRun = argv.includes('--dry-run');
 const flags = {};
 const positional = [];
+// `pull-run … -- <command>` (#60): everything after a bare `--` is the wrapped command, passed through untouched.
+const passthrough = [];
 for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--' && cmd === 'pull-run') { passthrough.push(...argv.slice(i + 1)); break; }
   if (argv[i] === '--dry-run') continue;
   if (argv[i].startsWith('--')) {
     const k = argv[i].slice(2);
@@ -434,6 +440,71 @@ Next:
     : 'Verigent MCP server registered — project-local (this folder only), free tier.\nNo credentials, no scheduler, nothing billed.');
 }
 
+// ── PULL RUN (Kit walk S1 #60, 2026-10-07: "Still no spinner showing activity? I have no idea what is
+// happening.") ──────────────────────────────────────────────────────────────────────────────────────────────
+// The pull job (install-time + ~5x/day) used to be `claude -p` itself, so it told Verigent nothing while it
+// ran: the owner's page showed Connect "Waiting" and the other rows "Pending" through the whole first check.
+// Now the job runs `npx -y verigent@<this> pull-run <handle> --cwd <dir> -- <claude -p <cycle prompt>
+// --allowedTools <…>>` — the agent's command is unchanged and passed through untouched (THE SCHEDULED RUNS'
+// PERMISSIONS below still holds for it). Around it, the same reports the setup-check job makes (#58):
+//   • before: read setup-material, then POST `checking` = the steps this run works on (setupPlan — Connect
+//     while no check has landed yet, plus every unproven step the cycle's `prove pending` will attempt);
+//   • after: POST `run_ended: true, checking: []` (+ when the next check is due) — only if the start was sent.
+// Every report is BEST-EFFORT and BOUNDED (PULL_REPORT_TIMEOUT_MS each): no handle file (a bare `schedule`
+// with no `continuous`), Verigent unreachable, a refusal, a timeout — the agent's check runs all the same and
+// the job exits with the check's own exit code. The page's own ceiling (setup-flow.ts AGENT_RUN_MAX_MS, 25
+// min) stops a row spinning if an end report never arrives. No credentials in the job: the token is read
+// from the 0600 handle file `continuous` saved, exactly like the setup-check tick.
+const PULL_REPORT_TIMEOUT_MS = (() => { const v = Number(process.env.VERIGENT_PULL_REPORT_MS); return Number.isFinite(v) && v >= 100 && v <= 30_000 ? v : 10_000; })();
+/** The wrapper in front of the agent's command in the pull job (launchd ProgramArguments / the crontab line). */
+const pullRunPrefix = (npxBin, handle, cwd) => [npxBin, '-y', `verigent@${PKG_VERSION}`, 'pull-run', handle, '--cwd', cwd, '--'];
+/** One bounded, never-throwing POST to setup-material → the parsed reply, or null on any failure. */
+async function pullReport(handle, token, body) {
+  const ac = new AbortController();
+  let timer;
+  // A ref'd timer (AbortSignal.timeout is unref'd, so a stalled request could leave nothing holding the process).
+  const limit = new Promise((resolve) => { timer = setTimeout(() => { ac.abort(); resolve(null); }, PULL_REPORT_TIMEOUT_MS); });
+  const call = (async () => {
+    try {
+      const res = await fetch(SETUP_MATERIAL_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ handle, pull_token: token, ...body }), signal: ac.signal });
+      const data = await res.json().catch(() => ({}));
+      return { status: res.status, ok: res.ok, data: data && typeof data === 'object' ? data : {} };
+    } catch { return null; }
+  })();
+  try { return await Promise.race([call, limit]); } finally { clearTimeout(timer); }
+}
+async function cmdPullRun() {
+  const handle = positional[0];
+  const cwd = flags.cwd || process.cwd();
+  if (!passthrough.length) { console.error('Usage: npx verigent pull-run <handle> [--cwd <agent dir>] -- <the agent\'s command>  (run by the pull job `schedule` installs)'); process.exit(1); }
+  const log = (m) => console.log(`[pull-run ${new Date().toISOString()}] ${handle}: ${m}`);
+  let token = '';
+  let started = false;
+  if (handle && SAFE_HANDLE_RE.test(handle)) {
+    try { token = String(readHandleFile(cwd, handle).pull_token || '').trim(); } catch { token = ''; }
+  }
+  if (token) {
+    const r = await pullReport(handle, token, {});
+    if (r && r.ok && r.data && r.data.ok) {
+      const st = readSetupCheckState(cwd, handle);
+      const plan = setupPlan(r.data, { cwd, handle, channelSelfAsks: Number(st && st.channel_self_asks) || 0 });
+      if (plan.checking.length) {
+        const s = await pullReport(handle, token, { checking: plan.checking });
+        started = !!(s && s.ok);
+        log(started ? `run started — Verigent shows "Checking" on: ${plan.checking.join(', ')}.` : 'could not report the run start — the check runs anyway.');
+      }
+    } else log(`setup-material ${r ? `answered HTTP ${r.status}` : 'unreachable'} — no run report; the check runs anyway.`);
+  }
+  const res = spawnSync(passthrough[0], passthrough.slice(1), { cwd, stdio: 'inherit' });
+  const code = typeof res.status === 'number' ? res.status : 1;
+  if (res.error) log(`could not start ${passthrough[0]}: ${res.error.message}`);
+  if (started) {
+    const e = await pullReport(handle, token, { next_check_at: nextCheckAt(cwd, handle), run_ended: true, checking: [] });
+    log(e && e.ok ? 'run finished — reported.' : 'run finished — the end report did not go through (the page stops showing "Checking" by itself).');
+  }
+  process.exit(code);
+}
+
 // ── schedule ─────────────────────────────────────────────────────────────────
 // Installs a credential-free wake-up job: 5x/day, runs `claude -p <cycle prompt>` in the agent's
 // directory. The pull token stays in the MCP server config (agents.txt §5f) — never here.
@@ -494,7 +565,8 @@ function cmdSchedule() {
   <!-- Installed by \`npx verigent schedule\`. Contains NO credentials by design: the pull token
        lives only in the agent's MCP server config (verigent.ai/agents.txt §5f). -->
   <key>ProgramArguments</key>
-  <array>
+  <array>${pullRunPrefix(join(npxDir, 'npx'), handle, cwd).map((a) => `
+    <string>${esc(a)}</string>`).join('')}
     <string>${esc(claudeBin)}</string>
     <string>-p</string>
     <string>${esc(CYCLE_PROMPT)}</string>
@@ -531,7 +603,9 @@ First pull fires NOW (watch your agent's page — the dots move within minutes).
     const envPrefix = extraEnv.map(([k, v]) => `${k}=${JSON.stringify(v)} `).join('');
     // The prompt and allow list are SINGLE-quoted for the shell: the prompt carries backticks (the command the
     // agent runs), which inside double quotes cron's /bin/sh would execute as a command substitution.
-    const line = `13 1,6,11,16,21 * * * cd ${JSON.stringify(cwd)} && ${envPrefix}${JSON.stringify(claudeBin)} -p ${shq(CYCLE_PROMPT)} --allowedTools ${shq(allowed)} >> .verigent-pull.log 2>&1 ${tag}`;
+    const npxBin = dryRun ? '/usr/local/bin/npx' : (which('npx') || '/usr/local/bin/npx');
+    const wrap = pullRunPrefix(npxBin, handle, cwd).map((a) => shq(a)).join(' ');
+    const line = `13 1,6,11,16,21 * * * cd ${JSON.stringify(cwd)} && ${envPrefix}${wrap} ${JSON.stringify(claudeBin)} -p ${shq(CYCLE_PROMPT)} --allowedTools ${shq(allowed)} >> .verigent-pull.log 2>&1 ${tag}`;
     const current = (() => { try { return execSync('crontab -l', { encoding: 'utf8' }); } catch { return ''; } })();
     const cleaned = current.split('\n').filter((l) => !l.includes(tag)).join('\n').replace(/\n+$/, '');
     const next = flags.uninstall ? cleaned : `${cleaned}\n${line}`;
@@ -651,6 +725,8 @@ function setupPlan(m, { cwd, handle, channelSelfAsks = 0 } = {}) {
   if (s.channel === 'pending' && !isEmail(inp.channel) && !selfChannel) waits.push('an email address on the setup page');
   // #58: the steps this run works on — the owner's page shows "Checking" on exactly these rows while it runs.
   const checking = [];
+  // #60: no check has landed yet → this run IS the agent's first check — the Connect row spins too.
+  if (!connected) checking.push('connect');
   if (s.identity === 'pending') checking.push('identity');
   if (endpointCan) checking.push('endpoint');
   if (walletCan) checking.push('wallet');
@@ -1856,4 +1932,5 @@ else if (cmd === 'register') cmdRegister();
 else if (cmd === 'continuous') await cmdContinuous();
 else if (cmd === 'prove') await cmdProve();
 else if (cmd === 'setup-check') await cmdSetupCheck();
+else if (cmd === 'pull-run') await cmdPullRun();
 else cmdSetup();
