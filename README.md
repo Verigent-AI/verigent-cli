@@ -134,6 +134,12 @@ yet, plus each unproven step `prove pending` will attempt), and after it, that t
 are best-effort and time-bounded — no handle file, Verigent unreachable or a refusal never stops or fails
 the check, and the job exits with the agent command's own exit code.
 
+Since 0.10.6: each run's start and end reports carry the run's own id, so one run ending never marks a step
+another run is still working on. `prove pending` no longer declares the email channel again while a code
+sent to that address is still valid, or while Verigent's send limit for channel codes is reached — it says
+when the next code can go instead. Crontab entries single-quote every path, and refuse a path containing
+`%` or a line break (cron would mangle it).
+
 ### What a scheduled run may do
 
 Both scheduled jobs run exactly `claude -p <prompt> --allowedTools <list>` from the agent's directory —

@@ -28,7 +28,7 @@
 // token via MCP env, and the handler job reads its secret from a 0600 file named by VG_SECRET_FILE.
 
 import { spawnSync, spawn, execSync } from 'node:child_process';
-import { createHmac, timingSafeEqual, generateKeyPairSync, createPrivateKey, createPublicKey, sign } from 'node:crypto';
+import { createHmac, timingSafeEqual, generateKeyPairSync, createPrivateKey, createPublicKey, sign, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { get as httpsGet } from 'node:https';
 import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, chmodSync, readdirSync, openSync, closeSync, statSync, utimesSync } from 'node:fs';
@@ -238,6 +238,22 @@ const which = (bin) => {
 };
 /** POSIX single-quoting: nothing inside is expanded by the shell (no $, no backticks). */
 const shq = (x) => `'${String(x).replace(/'/g, `'\\''`)}'`;
+/** One value on a crontab line (review L9): POSIX single-quoted like every other shell word — and REFUSED when
+ *  it holds '%' (cron turns an unescaped % into a newline, inside quotes too) or a line break (it would end
+ *  the entry). Refusing beats guessing at cron's escaping: nothing is installed and the operator is told. */
+function cronQ(x, what) {
+  const v = String(x);
+  if (/[%\r\n]/.test(v)) {
+    console.error(`Refusing to install the cron job: ${what} contains ${v.includes('%') ? "'%'" : 'a line break'}, which cron would mangle (${JSON.stringify(v)}). Use a path without it.`);
+    process.exit(1);
+  }
+  return shq(v);
+}
+/** The env prefix of a crontab line: NAME='value' pairs, names restricted to shell identifiers. */
+const cronEnv = (extraEnv) => extraEnv.map(([k, v]) => {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) { console.error(`Refusing --env ${JSON.stringify(k)}: not a valid environment variable name.`); process.exit(1); }
+  return `${k}=${cronQ(v, `--env ${k}`)} `;
+}).join('');
 const jobLabel = (kind, handle) => `ai.verigent.${kind}.${handle.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** Poll `fn` every `every` ms for up to `ms`; the first truthy value, else null. */
@@ -458,6 +474,8 @@ Next:
 const PULL_REPORT_TIMEOUT_MS = (() => { const v = Number(process.env.VERIGENT_PULL_REPORT_MS); return Number.isFinite(v) && v >= 100 && v <= 30_000 ? v : 10_000; })();
 /** The wrapper in front of the agent's command in the pull job (launchd ProgramArguments / the crontab line). */
 const pullRunPrefix = (npxBin, handle, cwd) => [npxBin, '-y', `verigent@${PKG_VERSION}`, 'pull-run', handle, '--cwd', cwd, '--'];
+/** A fresh id for one agent run's `checking` / `run_ended` pair (review L6) — 24 hex chars. */
+const newRunId = () => randomBytes(12).toString('hex');
 /** One bounded, never-throwing POST to setup-material → the parsed reply, or null on any failure. */
 async function pullReport(handle, token, body) {
   const ac = new AbortController();
@@ -480,6 +498,7 @@ async function cmdPullRun() {
   const log = (m) => console.log(`[pull-run ${new Date().toISOString()}] ${handle}: ${m}`);
   let token = '';
   let started = false;
+  const runId = newRunId(); // review L6: this run's id — sent with `checking`, echoed with `run_ended`
   if (handle && SAFE_HANDLE_RE.test(handle)) {
     try { token = String(readHandleFile(cwd, handle).pull_token || '').trim(); } catch { token = ''; }
   }
@@ -489,7 +508,7 @@ async function cmdPullRun() {
       const st = readSetupCheckState(cwd, handle);
       const plan = setupPlan(r.data, { cwd, handle, channelSelfAsks: Number(st && st.channel_self_asks) || 0 });
       if (plan.checking.length) {
-        const s = await pullReport(handle, token, { checking: plan.checking });
+        const s = await pullReport(handle, token, { checking: plan.checking, run_id: runId });
         started = !!(s && s.ok);
         log(started ? `run started — Verigent shows "Checking" on: ${plan.checking.join(', ')}.` : 'could not report the run start — the check runs anyway.');
       }
@@ -499,7 +518,7 @@ async function cmdPullRun() {
   const code = typeof res.status === 'number' ? res.status : 1;
   if (res.error) log(`could not start ${passthrough[0]}: ${res.error.message}`);
   if (started) {
-    const e = await pullReport(handle, token, { next_check_at: nextCheckAt(cwd, handle), run_ended: true, checking: [] });
+    const e = await pullReport(handle, token, { next_check_at: nextCheckAt(cwd, handle), run_ended: true, run_id: runId, checking: [] });
     log(e && e.ok ? 'run finished — reported.' : 'run finished — the end report did not go through (the page stops showing "Checking" by itself).');
   }
   process.exit(code);
@@ -600,12 +619,13 @@ First pull fires NOW (watch your agent's page — the dots move within minutes).
   } else if (process.platform === 'linux') {
     const claudeBin = dryRun ? '/usr/local/bin/claude' : execSync('command -v claude', { encoding: 'utf8' }).trim();
     const tag = `# ${label}`;
-    const envPrefix = extraEnv.map(([k, v]) => `${k}=${JSON.stringify(v)} `).join('');
-    // The prompt and allow list are SINGLE-quoted for the shell: the prompt carries backticks (the command the
-    // agent runs), which inside double quotes cron's /bin/sh would execute as a command substitution.
+    // Nothing to quote on --uninstall (the entry is found by its tag) — so an unquotable path can still be removed.
+    const envPrefix = flags.uninstall ? '' : cronEnv(extraEnv);
+    // EVERY word is SINGLE-quoted for the shell (review L9): the prompt carries backticks (the command the agent
+    // runs), and a double-quoted cwd / path would let cron's /bin/sh expand $ and backticks inside it.
     const npxBin = dryRun ? '/usr/local/bin/npx' : (which('npx') || '/usr/local/bin/npx');
-    const wrap = pullRunPrefix(npxBin, handle, cwd).map((a) => shq(a)).join(' ');
-    const line = `13 1,6,11,16,21 * * * cd ${JSON.stringify(cwd)} && ${envPrefix}${wrap} ${JSON.stringify(claudeBin)} -p ${shq(CYCLE_PROMPT)} --allowedTools ${shq(allowed)} >> .verigent-pull.log 2>&1 ${tag}`;
+    const wrap = flags.uninstall ? '' : pullRunPrefix(npxBin, handle, cwd).map((a) => cronQ(a, 'the working directory or npx path')).join(' ');
+    const line = flags.uninstall ? '' : `13 1,6,11,16,21 * * * cd ${cronQ(cwd, 'the working directory')} && ${envPrefix}${wrap} ${cronQ(claudeBin, 'the claude path')} -p ${cronQ(CYCLE_PROMPT, 'the cycle prompt')} --allowedTools ${cronQ(allowed, 'the allowed-tools list')} >> .verigent-pull.log 2>&1 ${tag}`;
     const current = (() => { try { return execSync('crontab -l', { encoding: 'utf8' }); } catch { return ''; } })();
     const cleaned = current.split('\n').filter((l) => !l.includes(tag)).join('\n').replace(/\n+$/, '');
     const next = flags.uninstall ? cleaned : `${cleaned}\n${line}`;
@@ -694,6 +714,13 @@ const setupCheckPlistPath = (handle) => join(homedir(), 'Library', 'LaunchAgents
 const wantSetupCheck = (handle, cwd) => !flags.uninstall && (cmd === 'continuous' || existsSync(handleFilePath(cwd, handle)));
 const isEmail = (x) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(x || '').replace(/^e-?mail\s*[:\-–—]?\s*/i, '').trim());
 const bareEmail = (x) => String(x || '').replace(/^e-?mail\s*[:\-–—]?\s*/i, '').trim();
+/** A channel code is out, unexpired and has tries left (setup-material `channel.code`). */
+const codeIsLive = (ch) => !!(ch && ch.code && ch.code.pending && !ch.code.expired && !ch.code.exhausted);
+/** "after 14:05 UTC" from a setup-material send_block (review M1) — or a plain fallback. */
+const sendBlockWhen = (b) => {
+  const t = Date.parse(b && b.retry_after);
+  return Number.isFinite(t) ? `Verigent sends a new one after ${new Date(t).toISOString().slice(0, 16).replace('T', ' ')} UTC` : 'Verigent sends a new one later';
+};
 
 /** What the setup-material says about setup, from the agent's side: settled? anything the agent can act on? */
 // #53 (Ant 2026-10-07 06:22): an agent that knows its own inbox declares its OWN output channel inside its setup
@@ -717,12 +744,18 @@ function setupPlan(m, { cwd, handle, channelSelfAsks = 0 } = {}) {
   const walletCan = s.wallet === 'pending' && (!!(m && m.wallet_on_record) || !!(inp.rail && inp.cap));
   if (walletCan) acts.push('payment');
   const selfChannel = s.channel === 'pending' && !isEmail(inp.channel) && channelSelfAsks < CHANNEL_SELF_ASKS;
-  if ((s.channel === 'pending' && isEmail(inp.channel)) || (s.channel === 'declared' && !!ch.email)) acts.push('output channel');
+  // Review M1: a code the agent must READ (live) is something to do; a new code Verigent won't send yet (the
+  // send cap — `channel.send_block`) is a wait, never a re-declaration.
+  const codeLive = codeIsLive(ch);
+  const channelBlocked = !codeLive && !!ch.send_block;
+  const channelCan = ((s.channel === 'pending' && isEmail(inp.channel)) || (s.channel === 'declared' && !!ch.email)) && !channelBlocked;
+  if (channelCan) acts.push('output channel');
   else if (selfChannel) acts.push('output channel (its own inbox)');
   const waits = [];
   if (s.endpoint === 'pending' && !endpointCan) waits.push('a public URL for the endpoint');
   if (s.wallet === 'pending' && !walletCan) waits.push('a rail + cap on the setup page');
   if (s.channel === 'pending' && !isEmail(inp.channel) && !selfChannel) waits.push('an email address on the setup page');
+  if (channelBlocked && ((s.channel === 'pending' && isEmail(inp.channel)) || (s.channel === 'declared' && !!ch.email))) waits.push(`the next channel code (${sendBlockWhen(ch.send_block)})`);
   // #58: the steps this run works on — the owner's page shows "Checking" on exactly these rows while it runs.
   const checking = [];
   // #60: no check has landed yet → this run IS the agent's first check — the Connect row spins too.
@@ -784,8 +817,8 @@ function installSetupCheck({ handle, cwd, claudeBin, allowed, extraEnv, npxBin }
     console.log(`Installed ${say}`);
   } else if (process.platform === 'linux') {
     const tag = `# ${label}`;
-    const envPrefix = extraEnv.map(([k, v]) => `${k}=${JSON.stringify(v)} `).join('');
-    const line = `*/5 * * * * cd ${JSON.stringify(cwd)} && ${envPrefix}${args.map((a) => JSON.stringify(a)).join(' ')} >> .verigent-pull.log 2>&1 ${tag}`;
+    const envPrefix = cronEnv(extraEnv);
+    const line = `*/5 * * * * cd ${cronQ(cwd, 'the working directory')} && ${envPrefix}${args.map((a) => cronQ(a, 'the working directory or npx path')).join(' ')} >> .verigent-pull.log 2>&1 ${tag}`;
     if (dryRun) { console.log(`[dry-run] would write ${setupCheckStatePath(cwd, handle)} and the crontab entry:\n${line}`); return; }
     writeSetupCheckState(cwd, handle, state);
     const current = (() => { try { return execSync('crontab -l', { encoding: 'utf8' }); } catch { return ''; } })();
@@ -951,7 +984,8 @@ async function cmdSetupCheck() {
   const prompt = plan.connected ? setupPrompt(handle) : cyclePrompt(handle);
   // #58: tell Verigent which steps this run works on, so the owner's page shows "Checking" on those rows
   // (best-effort — a miss only means the rows don't spin; the proofs still land).
-  if (plan.checking.length) { try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, checking: plan.checking }); } catch { /* best-effort */ } }
+  const runId = newRunId(); // review L6: a later run_ended names THIS run, so an overlapping run's end can't mark it
+  if (plan.checking.length) { try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, checking: plan.checking, run_id: runId }); } catch { /* best-effort */ } }
   const extras = Array.isArray(st.allow_extra) ? st.allow_extra : legacyExtras(st.allowed);
   const res = spawnSync(st.claude_bin || 'claude', ['-p', prompt, '--allowedTools', scheduledAllowed(extras)], { cwd, stdio: 'inherit', timeout: SETUP_CHECK_RUN_TIMEOUT_MS });
   release();
@@ -959,7 +993,7 @@ async function cmdSetupCheck() {
   // #47 b: the run took a while — say when the next tick is from NOW (best-effort; a miss changes nothing).
   // #58: the run is over — Verigent clears the rows' "Checking" and, for a payment / channel the run left
   // unproven without saying why, shows that it ended without one (never a proof).
-  try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, next_check_at: nextCheckAt(cwd, handle), run_ended: true, checking: [] }); } catch { /* the next tick reports again */ }
+  try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, next_check_at: nextCheckAt(cwd, handle), run_ended: true, run_id: runId, checking: [] }); } catch { /* the next tick reports again */ }
   process.exit(0);
 }
 
@@ -1049,8 +1083,13 @@ function startSetupCheckNow(agent) {
   if (process.platform === 'linux') {
     try {
       const out = openSync(join(cwd, '.verigent-pull.log'), 'a');
-      const child = spawn('npx', ['-y', `verigent@${PKG_VERSION}`, 'setup-check', handle, '--cwd', cwd], { cwd, detached: true, stdio: ['ignore', out, out] });
-      child.unref();
+      try {
+        const child = spawn('npx', ['-y', `verigent@${PKG_VERSION}`, 'setup-check', handle, '--cwd', cwd], { cwd, detached: true, stdio: ['ignore', out, out] });
+        // Review L5: an async spawn failure (npx missing, EACCES) is an 'error' event — unhandled, it would crash
+        // the long-running handler. Log it; the reply already went out as started (the next tick still runs).
+        child.on('error', (e) => { console.error(`[check-now] could not start the setup check for ${handle}: ${e && e.message ? e.message : e}`); });
+        child.unref();
+      } finally { closeSync(out); } // the child holds its own copy of the fd; ours is closed either way
       return { started: true, reason: null };
     } catch { return { started: false, reason: 'spawn_failed' }; }
   }
@@ -1570,7 +1609,7 @@ async function provePending(ctx) {
       }
     }
   }
-  const codeLive = !!(ch.code && ch.code.pending && !ch.code.expired && !ch.code.exhausted);
+  const codeLive = codeIsLive(ch);
   if (s.channel === 'declared' && ch.email && codeLive) {
     acted = true;
     console.log(`output channel: a code went to ${ch.email}. Find Verigent's email with the code for this agent's output channel in that inbox, then run:`);
@@ -1586,6 +1625,9 @@ async function provePending(ctx) {
       console.log(`Then find Verigent's email with the code in that inbox (on this check or your next one) and run:`);
       console.log(`  ${PENDING_CMD} --code <code>`);
       console.log("Only to read the code Verigent sends there. If you don't read an inbox of your own, leave this — your owner can type one on the setup page.");
+    } else if (ch.send_block) {
+      // Review M1: Verigent won't send another code yet (per-agent / per-address cap) — don't re-declare; say why.
+      console.log(`output channel: no new code this check — ${String(ch.send_block.reason || sendBlockWhen(ch.send_block))}`);
     } else {
       acted = true;
       const r = await postProof(ctx, { step: 'channel', channel: `email ${email}` });
@@ -1825,7 +1867,7 @@ cloudflared tunnel --no-autoupdate --url http://localhost:${port}` : `exec ${han
     console.log(`${already ? 'Handler job already installed — replaced' : 'Installed'} ${label} (launchd, kept alive across reboots): ${scriptPath}. Log: ${logPath}`);
   } else if (process.platform === 'linux') {
     const tag = `# ${label}`;
-    const line = `@reboot /bin/sh ${JSON.stringify(scriptPath)} >> ${JSON.stringify(logPath)} 2>&1 ${tag}`;
+    const line = `@reboot /bin/sh ${cronQ(scriptPath, 'the handler script path')} >> ${cronQ(logPath, 'the handler log path')} 2>&1 ${tag}`;
     const current = (() => { try { return execSync('crontab -l', { encoding: 'utf8' }); } catch { return ''; } })();
     const cleaned = current.split('\n').filter((l) => !l.includes(tag)).join('\n').replace(/\n+$/, '');
     execSync('crontab -', { input: `${cleaned}\n${line}\n` });
