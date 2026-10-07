@@ -734,6 +734,11 @@ function setupPlan(m, { cwd, handle, channelSelfAsks = 0 } = {}) {
   const inp = (m && m.owner_inputs) || {};
   const ch = (m && m.channel) || {};
   const connected = !!(m && m.connected === true);
+  // Q-AC: sovereignty testing off → the only thing the agent can act on is its first check (if none has landed);
+  // never settled (the tick keeps looking, uncounted, so a switch-on inside the window is picked up within minutes).
+  if (proofTestingOff(m)) {
+    return { connected, settled: false, acts: connected ? [] : ['first check'], waits: [SOV_OFF_WAIT], selfChannel: false, checking: connected ? [] : ['connect'], proofTesting: 'off' };
+  }
   const done = (k) => s[k] === 'proven' || s[k] === 'skipped';
   const channelOpen = s.channel === 'pending' || (s.channel === 'declared' && !!ch.email);
   const endpointCan = s.endpoint === 'pending' && (!!(cwd && savedEndpointUrl(cwd, handle)) || !!which('cloudflared'));
@@ -1233,6 +1238,16 @@ const SETUP_PROOF_URL = `${SITE}/api/agent/setup-proof`;
 // payment and channel on their own — Kit 5/5 within 70 s), so the line no longer sends them to fill inputs.
 const CONTINUOUS_CLOSE = "Nothing else to run: Verigent's scheduled checks finish the rest automatically. Your owner only acts if the setup page asks.";
 const SETUP_MATERIAL_URL = `${SITE}/api/agent/setup-material`;
+// SOVEREIGNTY TESTING IS THE OWNER'S FREE OPT-IN (Q-AC, Ant 2026-10-08 06:27; cli 0.10.8). setup-material says
+// `proof_testing: "off"` until the owner presses "Turn on sovereignty testing — free" on the plan page. While it
+// is off: `continuous` connects only, the setup-check tick runs only the first check (and otherwise waits,
+// uncounted), and `prove pending` attempts none of the four proofs. The server refuses them too (setup-proof
+// 409 proof_testing_off). Once it is on, the next scheduled check picks the proofs up — no second paste.
+const proofTestingOff = (m) => !!(m && m.proof_testing === 'off');
+const SOV_OFF_LINE = "Off for this agent: its owner turns sovereignty testing on (free) on the plan page. Until then this command connects the agent only — no signing key, endpoint, payment or output channel is attempted. Once it is on, the agent's scheduled checks pick the proofs up; nothing to paste again.";
+const SOV_OFF_NEXT = 'off until the owner turns it on (plan page)';
+const SOV_OFF_CLOSE = "Nothing else to run: the agent's checks run on Verigent's schedule.";
+const SOV_OFF_WAIT = 'sovereignty testing to be turned on (the owner\'s plan page)';
 // The summary's "next" column (#42): never a Verigent command — Verigent's own scheduled checks finish it,
 // and the owner acts only if the setup page asks (#63).
 const OWNER_PAGE_NEXT = "Verigent's setup checks finish it; owner acts only if the page asks";
@@ -1427,6 +1442,17 @@ async function cmdContinuous() {
   if (dryRun) console.log(`[dry-run] would save ${handleFilePath(cwd, handle)} (0600) — handle, pull token, site — for the setup checks`);
   else console.log(`Saved ${saveHandleFile(cwd, handle, token)} (mode 0600) — the setup checks read the handle and pull token from it.`);
 
+  // ── sovereignty testing OFF (Q-AC, Ant 2026-10-08 06:27): the owner's free opt-in on the plan page. Until it is
+  // on, this command connects the agent ONLY — no signing key, no endpoint handler or tunnel, no secret file, no
+  // payment, no channel. Once it is on, the scheduled checks (`prove pending` at the end of every pull) pick the
+  // four proofs up: nothing to paste again. ──
+  if (proofTestingOff(m)) {
+    console.log(`\n── sovereignty testing ──\n${SOV_OFF_LINE}`);
+    for (const s of ['identity', 'endpoint', 'wallet', 'channel']) row(s, 'off', SOV_OFF_NEXT);
+    printContinuousSummary(rows, m, handle, SOV_OFF_CLOSE);
+    return;
+  }
+
   // ── identity: reuse the key, or make one (#39 — the key is Verigent machinery), sign, report ──
   console.log(`\n── identity ──`);
   if (proven('identity')) {
@@ -1493,10 +1519,16 @@ async function cmdContinuous() {
     row('channel', ...(proven('channel') ? ['already proven'] : [steps.channel === 'declared' ? 'declared' : 'not proven', OWNER_PAGE_NEXT]));
   }
 
-  // ── summary ──
+  printContinuousSummary(rows, m, handle, CONTINUOUS_CLOSE);
+}
+
+// ── summary ── (shared by the full run and the sovereignty-off run, Q-AC)
+function printContinuousSummary(rows, m, handle, close) {
   const w = [Math.max(...rows.map((r) => r[0].length), 4), Math.max(...rows.map((r) => r[1].length), 6)];
   const line = (a, b, c) => `  ${a.padEnd(w[0])}  ${b.padEnd(w[1])}  ${c}`;
-  console.log(`\n── summary ──\n${line('step', 'result', 'next')}\n${rows.map((r) => line(...r)).join('\n')}\n\nSend the pull token only to ${SITE}. Record: ${(m && typeof m.page_url === "string" && m.page_url.startsWith(SITE)) ? m.page_url : `${SITE}/agent/${handle}`} — each proof lights up there as it lands.\n${CONTINUOUS_CLOSE}\n`);
+  const record = (m && typeof m.page_url === "string" && m.page_url.startsWith(SITE)) ? m.page_url : `${SITE}/agent/${handle}`;
+  const lights = proofTestingOff(m) ? 'its checks show there as they land' : 'each proof lights up there as it lands';
+  console.log(`\n── summary ──\n${line('step', 'result', 'next')}\n${rows.map((r) => line(...r)).join('\n')}\n\nSend the pull token only to ${SITE}. Record: ${record} — ${lights}.\n${close}\n`);
 }
 
 // #58 follow-up: how the agent says it won't do a step this run (its owner sees the reason on the setup page).
@@ -1545,6 +1577,12 @@ async function provePending(ctx) {
   // #47 b: every pull ends here — tell Verigent when this agent's next check is due (omitted when unknown).
   const next = nextCheckAt(ctx.cwd, ctx.handle);
   const m = await fetchMaterial(ctx.site, ctx.handle, ctx.token, next ? { next_check_at: next } : null);
+  // Q-AC (2026-10-08): sovereignty testing is off → this check attempts none of the four proofs.
+  if (proofTestingOff(m)) {
+    console.log("sovereignty testing is off for this agent — nothing to prove this check. Its owner can turn it on (free) on the plan page; the next check after that picks the proofs up.");
+    console.log(recordLine(ctx));
+    process.exit(0);
+  }
   const s = m.steps || {};
   const inp = m.owner_inputs || {};
   const ch = m.channel || {};

@@ -140,6 +140,14 @@ sent to that address is still valid, or while Verigent's send limit for channel 
 when the next code can go instead. Crontab entries single-quote every path, and refuse a path containing
 `%` or a line break (cron would mangle it).
 
+Since 0.10.8: **sovereignty testing is the owner's free opt-in.** The setup material says `proof_testing:
+"off"` until the owner turns it on ("Turn on sovereignty testing — free" on the agent's plan page). While it
+is off, `continuous` connects the agent only — no signing key, endpoint handler, tunnel, secret file, payment
+or channel is attempted; the setup-check job runs only the agent's first check and otherwise waits
+(uncounted); `prove pending` attempts none of the four proofs. Verigent refuses them too (`setup-proof`
+answers 409 `proof_testing_off`). Once it is on, the next scheduled check picks the proofs up — nothing to
+paste again.
+
 ### What a scheduled run may do
 
 Both scheduled jobs run exactly `claude -p <prompt> --allowedTools <list>` from the agent's directory —
