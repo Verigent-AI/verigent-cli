@@ -148,6 +148,20 @@ or channel is attempted; the setup-check job runs only the agent's first check a
 answers 409 `proof_testing_off`). Once it is on, the next scheduled check picks the proofs up — nothing to
 paste again.
 
+Since 0.10.9: **the setup check reacts within seconds, not five minutes.** Each setup-check tick now listens
+for up to ~285 s of its 5-minute slot: every ~10 s it asks Verigent with a cheap poll (`setup-material` with
+`poll: true` — two point reads, no secrets, no report budget) and acts the moment there is work: sovereignty
+testing just turned on, the owner pressed **Check again** on any step (a short-lived check request — before
+the endpoint exists too), or the owner changed a setup answer (rail, cap, address). The **signing key and the
+endpoint are proven by the CLI itself** — no agent run: it signs the nonce with the existing key (or makes
+one), and starts the handler + quick tunnel and reports its URL (with the tunnel-ready wait). Only the first
+check, the payment and the output channel take an agent run, and that run goes at the same time as the key and
+endpoint work (`prove pending` inside it leaves the key / endpoint alone while the setup check holds its
+`<handle>.local-proofs.lock`). Each pickup of a check request is acknowledged (`check_seen`) in the same report
+that lists what is being checked, so the owner's page shows "Checking" on those rows. Unchanged: one tick at a
+time (the lock), at most 24 agent runs in the two-hour window (local proofs cost none), never an agent run on
+top of the pull job, and the signed check-now via a proven endpoint (above) still starts the job between ticks.
+
 ### What a scheduled run may do
 
 Both scheduled jobs run exactly `claude -p <prompt> --allowedTools <list>` from the agent's directory —

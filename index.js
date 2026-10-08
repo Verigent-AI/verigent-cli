@@ -508,10 +508,11 @@ async function cmdPullRun() {
     if (r && r.ok && r.data && r.data.ok) {
       const st = readSetupCheckState(cwd, handle);
       const plan = setupPlan(r.data, { cwd, handle, channelSelfAsks: Number(st && st.channel_self_asks) || 0 });
-      if (plan.checking.length) {
-        const s = await pullReport(handle, token, { checking: plan.checking, run_id: runId });
+      const steps = runChecking(plan); // the pull's own `prove pending` proves the key / endpoint too
+      if (steps.length) {
+        const s = await pullReport(handle, token, { checking: steps, run_id: runId });
         started = !!(s && s.ok);
-        log(started ? `run started — Verigent shows "Checking" on: ${plan.checking.join(', ')}.` : 'could not report the run start — the check runs anyway.');
+        log(started ? `run started — Verigent shows "Checking" on: ${steps.join(', ')}.` : 'could not report the run start — the check runs anyway.');
       }
     } else log(`setup-material ${r ? `answered HTTP ${r.status}` : 'unreachable'} — no run report; the check runs anyway.`);
   }
@@ -694,6 +695,10 @@ Testing starts at the agent's first check; the report reads Current from there. 
 //     optional --allow extras) — see THE SCHEDULED RUNS' PERMISSIONS above.
 //   • One run at a time (a lock file, stale after 30 minutes, touched while a tick waits on the pull) — cron
 //     would otherwise overlap a slow one.
+//   • v130 (#64, cli 0.10.9 — Ant 2026-10-09 06:03): a tick no longer looks once and goes. After the first look it
+//     LISTENS for up to SETUP_LOOP_MS of its slot (the cheap poll every SETUP_LOOP_POLL_MS) and acts at once on
+//     a switch-on, the owner's "Check again" (a check request) or a changed owner answer; the signing key and the
+//     endpoint are proven by this process with no agent run — see THE TICK, LIVE in cmdSetupCheck.
 // The job holds NO credentials (§5f): the state file names the claude binary and the allowed tools only.
 const SETUP_CHECK_EVERY_S = 300;
 // The pull job's launchd period (4h48m = 5x/day); the Linux crontab line runs at :13 past these local hours.
@@ -709,6 +714,10 @@ const SETUP_CHECK_PULL_POLL_MS = (() => { const v = Number(process.env.VERIGENT_
 const SETUP_CHECK_PULL_START_GRACE_MS = 60 * 1000;
 const SETUP_CHECK_LOCK_STALE_MS = 30 * 60 * 1000;
 const SETUP_CHECK_RUN_TIMEOUT_MS = 20 * 60 * 1000;
+// v130 (#64): how long one tick keeps listening inside its 5-minute slot, and how often it asks (the cheap poll).
+// The env overrides exist for the tests (0 = look once and go — the pre-0.10.9 tick).
+const SETUP_LOOP_MS = (() => { const v = Number(process.env.VERIGENT_SETUP_LOOP_MS); return Number.isFinite(v) && v >= 0 && v <= 295_000 ? v : 285_000; })();
+const SETUP_LOOP_POLL_MS = (() => { const v = Number(process.env.VERIGENT_SETUP_LOOP_POLL_MS); return Number.isFinite(v) && v >= 10 && v <= 60_000 ? v : 10_000; })();
 const setupCheckStatePath = (cwd, handle) => join(cwd, '.verigent', `${handle}.setup-check.json`);
 const setupCheckPlistPath = (handle) => join(homedir(), 'Library', 'LaunchAgents', `${jobLabel('setupcheck', handle)}.plist`);
 /** Installed by `continuous` (and by `schedule` once a handle file exists — the tick needs its token). */
@@ -737,7 +746,7 @@ function setupPlan(m, { cwd, handle, channelSelfAsks = 0 } = {}) {
   // Q-AC: sovereignty testing off → the only thing the agent can act on is its first check (if none has landed);
   // never settled (the tick keeps looking, uncounted, so a switch-on inside the window is picked up within minutes).
   if (proofTestingOff(m)) {
-    return { connected, settled: false, acts: connected ? [] : ['first check'], waits: [SOV_OFF_WAIT], selfChannel: false, checking: connected ? [] : ['connect'], proofTesting: 'off' };
+    return { connected, settled: false, acts: connected ? [] : ['first check'], local: [], run: connected ? [] : ['first check'], waits: [SOV_OFF_WAIT], selfChannel: false, checking: connected ? [] : ['connect'], proofTesting: 'off' };
   }
   const done = (k) => s[k] === 'proven' || s[k] === 'skipped';
   const channelOpen = s.channel === 'pending' || (s.channel === 'declared' && !!ch.email);
@@ -762,16 +771,26 @@ function setupPlan(m, { cwd, handle, channelSelfAsks = 0 } = {}) {
   if (s.wallet === 'pending' && !walletCan) waits.push('a rail + cap on the setup page');
   if (s.channel === 'pending' && !isEmail(inp.channel) && !selfChannel) waits.push('an email address on the setup page');
   if (channelBlocked && ((s.channel === 'pending' && isEmail(inp.channel)) || (s.channel === 'declared' && !!ch.email))) waits.push(`the next channel code (${sendBlockWhen(ch.send_block)})`);
-  // #58: the steps this run works on — the owner's page shows "Checking" on exactly these rows while it runs.
+  // v130 (#64, cli 0.10.9): the signing key and the endpoint need NO agent run — the setup check proves them
+  // itself, at once (`local`); only the first check, the payment and the output channel take one (`run`).
+  const local = [];
+  if (s.identity === 'pending') local.push('identity');
+  if (endpointCan) local.push('endpoint');
+  const run = acts.filter((a) => a !== 'signing key' && a !== 'endpoint');
+  // #58: the steps the AGENT RUN works on — the owner's page shows "Checking" on exactly these rows while it
+  // runs (the loop adds the `local` steps it is proving beside it to the same list).
   const checking = [];
   // #60: no check has landed yet → this run IS the agent's first check — the Connect row spins too.
   if (!connected) checking.push('connect');
-  if (s.identity === 'pending') checking.push('identity');
-  if (endpointCan) checking.push('endpoint');
   if (walletCan) checking.push('wallet');
   if (acts.some((a) => a.startsWith('output channel'))) checking.push('channel');
-  return { connected, settled: connected && done('identity') && done('endpoint') && done('wallet') && !channelOpen, acts, waits, selfChannel, checking };
+  return { connected, settled: connected && done('identity') && done('endpoint') && done('wallet') && !channelOpen, acts, local, run, waits, selfChannel, checking };
 }
+
+/** Board order for a `checking` report (the server re-orders too). */
+const CHECKING_ORDER = ['connect', 'identity', 'endpoint', 'wallet', 'channel'];
+/** Every step a run that ends in `prove pending` works on: the agent's own (plan.checking) + the key / endpoint. */
+const runChecking = (plan) => CHECKING_ORDER.filter((x) => plan.checking.includes(x) || (plan.local || []).includes(x));
 
 function installSetupCheck({ handle, cwd, claudeBin, allowed, extraEnv, npxBin }) {
   const label = jobLabel('setupcheck', handle);
@@ -967,9 +986,11 @@ async function cmdSetupCheck() {
 
   const token = String(readHandleFile(cwd, handle).pull_token || '').trim();
   if (!token) { release(); finish('no pull token in the handle file'); }
+  const auth = { handle, pull_token: token };
+  const ctx = { handle, token, site: SITE, cwd, file: null };
   let r;
   // #47 b: every tick tells Verigent when the agent's next check is due (the next tick) — the owner's page shows it.
-  try { r = await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, next_check_at: nextCheckAt(cwd, handle) }); }
+  try { r = await postJson(SETUP_MATERIAL_URL, { ...auth, next_check_at: nextCheckAt(cwd, handle) }); }
   catch (e) { count({ last_result: 'unreachable' }); release(); log(`couldn't reach ${SITE} (${e.message}) — no run this tick.`); process.exit(0); }
   if (r.status === 401) { release(); finish('the pull token was refused'); }
   if (!r.ok || !r.data || !r.data.ok) {
@@ -977,30 +998,180 @@ async function cmdSetupCheck() {
     log(`setup-material answered HTTP ${r.status}${r.data && r.data.reason ? ` (${r.data.reason})` : ''} — no run this tick.`);
     process.exit(0);
   }
-  const selfAsks = Number(st.channel_self_asks) || 0;
-  const plan = setupPlan(r.data, { cwd, handle, channelSelfAsks: selfAsks });
-  if (plan.settled) { release(); finish('setup settled'); }
-  if (!plan.acts.length) {
-    release();
-    log(`waiting on ${plan.waits.join(' · ') || 'nothing the agent can do'} — no run this tick.`);
-    process.exit(0);
+  const first = setupPlan(r.data, { cwd, handle, channelSelfAsks: Number(st.channel_self_asks) || 0 });
+  if (first.settled) { release(); finish('setup settled'); }
+
+  // ── THE TICK, LIVE (v130, #64 — Ant 2026-10-09 06:03: "if we don't get an answer immediately we should retest
+  // immediately… they need to be happening concurrently"). The tick no longer looks once and goes: for up to
+  // SETUP_LOOP_MS of its 5-minute slot it asks Verigent every SETUP_LOOP_POLL_MS with the CHEAP poll
+  // (setup-material `poll: true` — two point reads, no secrets, no report budget) and acts the moment there is
+  // work: sovereignty testing just switched on, the owner pressed "Check again" (a live check request), or an
+  // owner input changed (rail · cap · address, once it has held still for one poll). Acting = ONE full
+  // setup-material read, then — at the same time — the signing key and the endpoint proven by THIS process
+  // (no agent run: sign the nonce with the existing or a new key; start the handler + tunnel and report its URL,
+  // with the tunnel-ready wait), and ONE agent run for the first check / payment / output channel when there is
+  // one to do and none is live. Bounds unchanged: one tick at a time (the lock, touched every poll), at most
+  // SETUP_CHECK_MAX_TRIES agent runs in the 2-hour window (local proofs cost no run), never an agent run on top of
+  // the pull job. The `prove pending` inside an agent run skips the key / endpoint while this process holds the
+  // local-proofs lock, so the two never race.
+  let cur = { ...st };
+  const countRun = (extra = {}) => { cur = { ...cur, tries: (Number(cur.tries) || 0) + 1, last_try_at: new Date().toISOString(), ...extra }; writeSetupCheckState(cwd, handle, cur); };
+  const live = { id: null, runP: null, runSteps: [], localP: null, localSteps: [] };
+  const poll = (extra = {}) => postJson(SETUP_MATERIAL_URL, { ...auth, poll: true, ...extra });
+  const report = async (extra) => { try { await poll(extra); } catch { /* best-effort — a miss only means a row doesn't spin */ } };
+  let cappedSaid = false;
+
+  /** Start what the plan says can be done now and is not already under way. `seen` = the check request this
+   *  answers (acknowledged in the same report that lists what is being checked). */
+  const act = async (m, plan, seen = null) => {
+    const localNow = plan.local.filter((x) => !live.localSteps.includes(x));
+    let runNow = false;
+    if (plan.run.length && !live.runP) {
+      if ((Number(cur.tries) || 0) >= maxTries) { if (!cappedSaid) log(`cap reached (${cur.tries} runs) — no agent run; the key and endpoint are still checked here.`); cappedSaid = true; }
+      else if (pullJobRunning(handle, st) !== 'idle') log("the agent's scheduled check is running — no agent run on top of it.");
+      else runNow = true;
+    }
+    if (!runNow && !localNow.length) {
+      if (seen) await report({ check_seen: seen });
+      if (plan.waits.length && !live.runP && !live.localP) log(`waiting on ${plan.waits.join(' · ')} — no run this tick.`);
+      return;
+    }
+    // review L6: the run's end names THIS id, so an overlapping run's end can't mark it. A local-only session
+    // that is still live hands its id on to the run that joins it.
+    if (!live.id) live.id = newRunId();
+    if (runNow) live.runSteps = plan.checking;
+    live.localSteps = [...live.localSteps, ...localNow];
+    // #58: tell Verigent which rows are being worked on — the owner's page shows "Checking" on exactly those.
+    await report({ checking: CHECKING_ORDER.filter((x) => live.runSteps.includes(x) || live.localSteps.includes(x)), run_id: live.id, ...(seen ? { check_seen: seen } : {}) });
+    if (localNow.length) {
+      log(`to do here (no agent run): ${localNow.map((x) => (x === 'identity' ? 'signing key' : x)).join(' · ')}.`);
+      const prev = live.localP || Promise.resolve();
+      const p = prev.then(() => localProofs(ctx, m, localNow, log)).catch((e) => log(`local proof error: ${e && e.message}`))
+        .finally(() => { live.localSteps = live.localSteps.filter((x) => !localNow.includes(x)); if (live.localP === p) live.localP = null; });
+      live.localP = p;
+    }
+    if (runNow) {
+      countRun({ last_result: 'run', ...(plan.selfChannel ? { channel_self_asks: (Number(cur.channel_self_asks) || 0) + 1 } : {}) });
+      log(`to do: ${plan.run.join(' · ')} — agent run ${cur.tries} of ${maxTries}${plan.connected ? ' (setup only)' : ''}.`);
+      const prompt = plan.connected ? setupPrompt(handle) : cyclePrompt(handle);
+      const extras = Array.isArray(st.allow_extra) ? st.allow_extra : legacyExtras(st.allowed);
+      live.runP = agentRun(st.claude_bin || 'claude', ['-p', prompt, '--allowedTools', scheduledAllowed(extras)], cwd).then((res) => {
+        log(`run ended (exit ${res.status ?? res.signal ?? (res.error && res.error.code) ?? '?'}).`);
+        live.runP = null; live.runSteps = [];
+      });
+    }
+  };
+  /** Everything under way has finished → one report: the run ended (#58 — Verigent clears "Checking" and marks a
+   *  payment / channel the run left unproven), and the next check from now (#47 b). */
+  const closeIfIdle = async () => {
+    if (live.id && !live.runP && !live.localP) {
+      const id = live.id; live.id = null;
+      await report({ next_check_at: nextCheckAt(cwd, handle), run_ended: true, run_id: id, checking: [] });
+    }
+  };
+
+  const loopUntil = now + SETUP_LOOP_MS;
+  await act(r.data, first);
+  const last = { proof: r.data.proof_testing, inputsActed: inputsKey(r.data.owner_inputs), inputsPrev: inputsKey(r.data.owner_inputs), handled: null };
+  let finishWhy = null;
+  while (Date.now() < loopUntil) {
+    await sleepMs(Math.max(0, Math.min(SETUP_LOOP_POLL_MS, loopUntil - Date.now())));
+    try { const t = new Date(); utimesSync(lockPath, t, t); } catch { /* gone — carry on */ }
+    await closeIfIdle();
+    let p;
+    try { p = await poll(); } catch { continue; } // Verigent unreachable: look again next poll (uncounted)
+    if (p.status === 401) { finishWhy = 'the pull token was refused'; break; }
+    if (!p.ok || !p.data || !p.data.ok) continue;
+    const plan = setupPlan(p.data, { cwd, handle, channelSelfAsks: Number(cur.channel_self_asks) || 0 });
+    if (plan.settled && !live.runP && !live.localP) { finishWhy = 'setup settled'; break; }
+    const turnedOn = last.proof === 'off' && p.data.proof_testing === 'on';
+    last.proof = p.data.proof_testing;
+    const req = p.data.check_request && typeof p.data.check_request.at === 'string' && p.data.check_request.at !== last.handled ? p.data.check_request.at : null;
+    const ik = inputsKey(p.data.owner_inputs);
+    const inputsSettled = ik !== last.inputsActed && ik === last.inputsPrev; // changed, and held still for one poll
+    last.inputsPrev = ik;
+    if (!turnedOn && !req && !inputsSettled) continue;
+    log(`${turnedOn ? 'sovereignty testing switched on' : req ? 'your owner asked for a check now' : 'your owner changed a setup answer'} — checking now.`);
+    if (req) last.handled = req;
+    let full;
+    try { full = await postJson(SETUP_MATERIAL_URL, auth); } catch (e) { log(`couldn't reach ${SITE} (${e.message}).`); if (req) last.handled = null; continue; }
+    if (!full.ok || !full.data || !full.data.ok) { log(`setup-material answered HTTP ${full.status} — trying again on the next look.`); if (req) last.handled = null; continue; }
+    last.inputsActed = inputsKey(full.data.owner_inputs);
+    await act(full.data, setupPlan(full.data, { cwd, handle, channelSelfAsks: Number(cur.channel_self_asks) || 0 }), req);
   }
-  count({ last_result: 'run', ...(plan.selfChannel ? { channel_self_asks: selfAsks + 1 } : {}) });
-  log(`to do: ${plan.acts.join(' · ')} — agent run ${tries + 1} of ${maxTries}${plan.connected ? ' (setup only)' : ''}.`);
-  const prompt = plan.connected ? setupPrompt(handle) : cyclePrompt(handle);
-  // #58: tell Verigent which steps this run works on, so the owner's page shows "Checking" on those rows
-  // (best-effort — a miss only means the rows don't spin; the proofs still land).
-  const runId = newRunId(); // review L6: a later run_ended names THIS run, so an overlapping run's end can't mark it
-  if (plan.checking.length) { try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, checking: plan.checking, run_id: runId }); } catch { /* best-effort */ } }
-  const extras = Array.isArray(st.allow_extra) ? st.allow_extra : legacyExtras(st.allowed);
-  const res = spawnSync(st.claude_bin || 'claude', ['-p', prompt, '--allowedTools', scheduledAllowed(extras)], { cwd, stdio: 'inherit', timeout: SETUP_CHECK_RUN_TIMEOUT_MS });
+  // The slot is over (or setup settled): let what is under way finish, then say so once.
+  while (live.runP || live.localP) await Promise.all([live.runP, live.localP].filter(Boolean));
+  await closeIfIdle();
   release();
-  log(`run ended (exit ${res.status ?? res.signal ?? (res.error && res.error.code) ?? '?'}); the next tick asks Verigent again.`);
-  // #47 b: the run took a while — say when the next tick is from NOW (best-effort; a miss changes nothing).
-  // #58: the run is over — Verigent clears the rows' "Checking" and, for a payment / channel the run left
-  // unproven without saying why, shows that it ended without one (never a proof).
-  try { await postJson(SETUP_MATERIAL_URL, { handle, pull_token: token, next_check_at: nextCheckAt(cwd, handle), run_ended: true, run_id: runId, checking: [] }); } catch { /* the next tick reports again */ }
+  if (finishWhy) finish(finishWhy);
+  log('the next tick asks Verigent again.');
   process.exit(0);
+}
+
+/** The owner's three setup answers as one comparable string (a change is a reason to look now). */
+const inputsKey = (inp) => JSON.stringify([(inp && inp.rail) || null, (inp && inp.cap) || null, (inp && inp.channel) || null]);
+
+/** One agent run (`claude -p …`), ASYNC so the setup check keeps listening while it works (v130). Bounded by
+ *  SETUP_CHECK_RUN_TIMEOUT_MS. Never throws. */
+function agentRun(bin, args, cwd) {
+  return new Promise((resolveRun) => {
+    let child;
+    try { child = spawn(bin, args, { cwd, stdio: 'inherit', shell: isWin }); }
+    catch (e) { resolveRun({ status: null, error: e }); return; }
+    const t = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* gone */ } }, SETUP_CHECK_RUN_TIMEOUT_MS);
+    child.on('error', (e) => { clearTimeout(t); resolveRun({ status: null, error: e }); });
+    child.on('exit', (code, signal) => { clearTimeout(t); resolveRun({ status: code, signal }); });
+  });
+}
+
+// ── THE LOCAL PROOFS (v130): the signing key and the endpoint, proven by the CLI itself — no agent run, no LLM.
+// Shared by the setup-check loop and `prove pending`. A lock file (<cwd>/.verigent/<handle>.local-proofs.lock,
+// stale after LOCAL_PROOFS_LOCK_STALE_MS) keeps the two from proving the same step at once: whoever holds it does
+// both; the other says so and skips them.
+const LOCAL_PROOFS_LOCK_STALE_MS = 5 * 60 * 1000;
+const localProofsLockPath = (cwd, handle) => join(cwd, '.verigent', `${handle}.local-proofs.lock`);
+function takeLocalProofsLock(cwd, handle) {
+  const p = localProofsLockPath(cwd, handle);
+  mkdirSync(join(cwd, '.verigent'), { recursive: true, mode: 0o700 });
+  try { closeSync(openSync(p, 'wx')); }
+  catch {
+    let age = 0; try { age = Date.now() - statSync(p).mtimeMs; } catch { /* gone */ }
+    if (age < LOCAL_PROOFS_LOCK_STALE_MS) return null;
+    writeFileSync(p, '');
+  }
+  return () => { try { unlinkSync(p); } catch { /* gone */ } };
+}
+const localProofsBusy = (cwd, handle) => {
+  try { return Date.now() - statSync(localProofsLockPath(cwd, handle)).mtimeMs < LOCAL_PROOFS_LOCK_STALE_MS; } catch { return false; }
+};
+
+/** The endpoint, as a setup check does it: a running handler / cloudflared first (a quick tunnel's URL changes
+ *  when its job restarts — the live one is read from the job log); else a saved URL from an earlier proof.
+ *  → { acted, line } for the log. */
+async function endpointPending(ctx, m) {
+  const port = parseInt(flags.port || '8787', 10);
+  const known = savedEndpointUrl(ctx.cwd, ctx.handle);
+  if (canInstallJobs() && (which('cloudflared') || await handlerUp(port))) {
+    const a = await attemptEndpoint(ctx, { port, getSecret: async () => m.endpoint_secret });
+    return { acted: true, line: a.needs ? `endpoint: ${NEEDS_PUBLIC_URL}` : a.error ? `endpoint: ${a.error}` : `endpoint: ${saidLine(a.r)}` };
+  }
+  if (known) {
+    const r = await postProof(ctx, { step: 'endpoint', url: known });
+    return { acted: true, line: `endpoint: reported ${known}. ${saidLine(r)}` };
+  }
+  return { acted: false, line: `endpoint: ${NEEDS_PUBLIC_URL}` };
+}
+
+/** The loop's local work: the listed steps at the same time, under the local-proofs lock. */
+async function localProofs(ctx, m, steps, log) {
+  const release = takeLocalProofsLock(ctx.cwd, ctx.handle);
+  if (!release) { log('the signing key / endpoint are being proven by another check right now — left to it.'); return; }
+  try {
+    await Promise.all([
+      steps.includes('identity') ? attemptIdentity(ctx, m).then((a) => log(a.error ? `signing key: ${a.error}` : `signing key: ${a.how} ${saidLine(a.r)}`)) : null,
+      steps.includes('endpoint') ? endpointPending(ctx, m).then((e) => log(e.line)) : null,
+    ].filter(Boolean));
+  } finally { release(); }
 }
 
 // ── handler ──────────────────────────────────────────────────────────────────
@@ -1588,28 +1759,23 @@ async function provePending(ctx) {
   const ch = m.channel || {};
   let acted = false;
 
-  if (s.identity === 'pending') {
-    acted = true;
-    const a = await attemptIdentity(ctx, m);
-    console.log(a.error ? `signing key: ${a.error}` : `signing key: ${a.how} ${saidLine(a.r)}`);
-  }
-  if (s.endpoint === 'pending') {
-    // A running handler / cloudflared first (a quick tunnel's URL changes when its job restarts — the live one
-    // is read from the job log); else a saved URL from an earlier proof (a host the agent controls).
-    const port = parseInt(flags.port || '8787', 10);
-    const known = savedEndpointUrl(ctx.cwd, ctx.handle);
-    if (canInstallJobs() && (which('cloudflared') || await handlerUp(port))) {
+  // v130: the setup-check loop proves the key and the endpoint itself — while it holds the local-proofs lock,
+  // this check leaves them to it (never two handler installs or two signatures racing).
+  const localBusy = (s.identity === 'pending' || s.endpoint === 'pending') && localProofsBusy(ctx.cwd, ctx.handle);
+  if (localBusy) console.log('signing key · endpoint: being proven by the setup check right now — nothing to do for them here.');
+  const releaseLocal = localBusy ? null : takeLocalProofsLock(ctx.cwd, ctx.handle);
+  try {
+    if (!localBusy && s.identity === 'pending') {
       acted = true;
-      const a = await attemptEndpoint(ctx, { port, getSecret: async () => m.endpoint_secret });
-      console.log(a.needs ? `endpoint: ${NEEDS_PUBLIC_URL}` : a.error ? `endpoint: ${a.error}` : `endpoint: ${saidLine(a.r)}`);
-    } else if (known) {
-      acted = true;
-      const r = await postProof(ctx, { step: 'endpoint', url: known });
-      console.log(`endpoint: reported ${known}. ${saidLine(r)}`);
-    } else {
-      console.log(`endpoint: ${NEEDS_PUBLIC_URL}`);
+      const a = await attemptIdentity(ctx, m);
+      console.log(a.error ? `signing key: ${a.error}` : `signing key: ${a.how} ${saidLine(a.r)}`);
     }
-  }
+    if (!localBusy && s.endpoint === 'pending') {
+      const e = await endpointPending(ctx, m);
+      if (e.acted) acted = true;
+      console.log(e.line);
+    }
+  } finally { if (releaseLocal) releaseLocal(); }
   // #56 (Q-AA, Ant 2026-10-07 07:03): a payment this agent ALREADY made, verified by Verigent and still on
   // record, proves the step again — checked FIRST, so a check never asks for a new payment the server would
   // not need. The server looks it up by this agent alone; nothing is claimed here.
