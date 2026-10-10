@@ -141,7 +141,8 @@ when the next code can go instead. Crontab entries single-quote every path, and 
 `%` or a line break (cron would mangle it).
 
 Since 0.10.8: **sovereignty testing is the owner's free opt-in.** The setup material says `proof_testing:
-"off"` until the owner turns it on ("Turn on sovereignty testing — free" on the agent's plan page). While it
+"off"` until the owner turns it on ("Continue — turn on proof testing (free)" on the setup screen, offered right
+after the agent connects — since 0.10.10; it was a plan-page button in 0.10.8). While it
 is off, `continuous` connects the agent only — no signing key, endpoint handler, tunnel, secret file, payment
 or channel is attempted; the setup-check job runs only the agent's first check and otherwise waits
 (uncounted); `prove pending` attempts none of the four proofs. Verigent refuses them too (`setup-proof`
@@ -161,6 +162,10 @@ endpoint work (`prove pending` inside it leaves the key / endpoint alone while t
 that lists what is being checked, so the owner's page shows "Checking" on those rows. Unchanged: one tick at a
 time (the lock), at most 24 agent runs in the two-hour window (local proofs cost none), never an agent run on
 top of the pull job, and the signed check-now via a proven endpoint (above) still starts the job between ticks.
+
+Since 0.10.10: the "sovereignty testing is off" lines say where the owner turns it on — the setup screen right
+after the agent connects ("Continue — turn on proof testing (free)"), not "the plan page". Copy only; no
+behaviour change.
 
 ### What a scheduled run may do
 

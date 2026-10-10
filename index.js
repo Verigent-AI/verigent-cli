@@ -1410,15 +1410,16 @@ const SETUP_PROOF_URL = `${SITE}/api/agent/setup-proof`;
 const CONTINUOUS_CLOSE = "Nothing else to run: Verigent's scheduled checks finish the rest automatically. Your owner only acts if the setup page asks.";
 const SETUP_MATERIAL_URL = `${SITE}/api/agent/setup-material`;
 // SOVEREIGNTY TESTING IS THE OWNER'S FREE OPT-IN (Q-AC, Ant 2026-10-08 06:27; cli 0.10.8). setup-material says
-// `proof_testing: "off"` until the owner presses "Turn on sovereignty testing — free" on the plan page. While it
+// `proof_testing: "off"` until the owner presses "Continue — turn on proof testing (free)" on the setup screen right
+// after the agent connects (cli 0.10.10 — Ant 2026-10-11 07:09: the copy used to say "the plan page"). While it
 // is off: `continuous` connects only, the setup-check tick runs only the first check (and otherwise waits,
 // uncounted), and `prove pending` attempts none of the four proofs. The server refuses them too (setup-proof
 // 409 proof_testing_off). Once it is on, the next scheduled check picks the proofs up — no second paste.
 const proofTestingOff = (m) => !!(m && m.proof_testing === 'off');
-const SOV_OFF_LINE = "Off for this agent: its owner turns sovereignty testing on (free) on the plan page. Until then this command connects the agent only — no signing key, endpoint, payment or output channel is attempted. Once it is on, the agent's scheduled checks pick the proofs up; nothing to paste again.";
-const SOV_OFF_NEXT = 'off until the owner turns it on (plan page)';
+const SOV_OFF_LINE = "Off for this agent: its owner turns sovereignty testing on (free) on the setup screen right after the agent connects (\"Continue — turn on proof testing (free)\"). Until then this command connects the agent only — no signing key, endpoint, payment or output channel is attempted. Once it is on, the agent's scheduled checks pick the proofs up; nothing to paste again.";
+const SOV_OFF_NEXT = 'off until the owner turns it on (setup screen, after connect)';
 const SOV_OFF_CLOSE = "Nothing else to run: the agent's checks run on Verigent's schedule.";
-const SOV_OFF_WAIT = 'sovereignty testing to be turned on (the owner\'s plan page)';
+const SOV_OFF_WAIT = 'sovereignty testing to be turned on (the owner\'s setup screen, after connect)';
 // The summary's "next" column (#42): never a Verigent command — Verigent's own scheduled checks finish it,
 // and the owner acts only if the setup page asks (#63).
 const OWNER_PAGE_NEXT = "Verigent's setup checks finish it; owner acts only if the page asks";
@@ -1613,7 +1614,7 @@ async function cmdContinuous() {
   if (dryRun) console.log(`[dry-run] would save ${handleFilePath(cwd, handle)} (0600) — handle, pull token, site — for the setup checks`);
   else console.log(`Saved ${saveHandleFile(cwd, handle, token)} (mode 0600) — the setup checks read the handle and pull token from it.`);
 
-  // ── sovereignty testing OFF (Q-AC, Ant 2026-10-08 06:27): the owner's free opt-in on the plan page. Until it is
+  // ── sovereignty testing OFF (Q-AC, Ant 2026-10-08 06:27): the owner's free opt-in on the setup screen. Until it is
   // on, this command connects the agent ONLY — no signing key, no endpoint handler or tunnel, no secret file, no
   // payment, no channel. Once it is on, the scheduled checks (`prove pending` at the end of every pull) pick the
   // four proofs up: nothing to paste again. ──
@@ -1750,7 +1751,7 @@ async function provePending(ctx) {
   const m = await fetchMaterial(ctx.site, ctx.handle, ctx.token, next ? { next_check_at: next } : null);
   // Q-AC (2026-10-08): sovereignty testing is off → this check attempts none of the four proofs.
   if (proofTestingOff(m)) {
-    console.log("sovereignty testing is off for this agent — nothing to prove this check. Its owner can turn it on (free) on the plan page; the next check after that picks the proofs up.");
+    console.log("sovereignty testing is off for this agent — nothing to prove this check. Its owner can turn it on (free) on the setup screen right after the agent connects (\"Continue — turn on proof testing (free)\"); the next check after that picks the proofs up.");
     console.log(recordLine(ctx));
     process.exit(0);
   }
