@@ -492,6 +492,76 @@ async function pullReport(handle, token, body) {
   })();
   try { return await Promise.race([call, limit]); } finally { clearTimeout(timer); }
 }
+// ── STARTUP CONTEXT, MEASURED (cli 0.10.11 — Ant, explicit ruling 2026-10-11 10:24 via Chunk) ──────────────────
+// Every agent's startup context size is measured the same way, by its standard pull job. `schedule` now adds
+// `--output-format json` to the job's `claude -p …`, so the claude CLI prints one JSON result carrying its real
+// per-turn usage. pull-run reads it: the agent's result text still goes to the job log, and the usage is posted
+// to /api/probe/usage (the same endpoint and shape a hand-built wrapper uses) as the OBSERVED vitals —
+// first_turn_context_tokens = the first turn's input (uncached + cache read + cache written), plus totals.
+// BEST-EFFORT and BOUNDED like the run reports above: a passthrough that isn't a JSON-output run, output that
+// doesn't parse, no usage in it, no handle file, Verigent unreachable — all skip silently, and the job exits
+// with the check's own exit code. The token comes from the 0600 handle file, as for the run reports.
+const USAGE_URL = `${SITE}/api/probe/usage`;
+/** Does the wrapped command ask claude for one JSON result (`--output-format json` / `--output-format=json`)? */
+function wantsJsonResult(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--output-format' && argv[i + 1] === 'json') return true;
+    if (argv[i] === '--output-format=json') return true;
+  }
+  return false;
+}
+/** claude's JSON result text → the parsed object, or null. Tolerates log lines before the JSON (takes the last `{…}` line). */
+function parseClaudeResult(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  try { const o = JSON.parse(text); return o && typeof o === 'object' && !Array.isArray(o) ? o : null; } catch { /* fall through */ }
+  const lines = text.trim().split('\n').reverse();
+  for (const l of lines) {
+    const t = l.trim();
+    if (!t.startsWith('{')) continue;
+    try { const o = JSON.parse(t); if (o && typeof o === 'object' && !Array.isArray(o)) return o; } catch { /* next */ }
+  }
+  return null;
+}
+/**
+ * The usage blob /api/probe/usage takes, from claude's JSON result — or null when nothing was measured.
+ * First-turn context is read from usage.iterations[0]; without per-turn iterations it is taken from the
+ * aggregate ONLY for a one-turn run (an aggregate over several turns is not a first-turn figure).
+ */
+function usageFromClaudeResult(data) {
+  if (!data || typeof data !== 'object') return null;
+  const n = (x) => (typeof x === 'number' && Number.isFinite(x) && x >= 0 ? Math.floor(x) : 0);
+  const load = (it) => (it && typeof it === 'object' ? n(it.input_tokens) + n(it.cache_read_input_tokens) + n(it.cache_creation_input_tokens) : 0);
+  const usage = data.usage && typeof data.usage === 'object' ? data.usage : {};
+  const iters = Array.isArray(usage.iterations) ? usage.iterations.filter((it) => it && typeof it === 'object') : [];
+  const turns = n(data.num_turns) || iters.length || 1;
+  let first = null, inTotal, outTotal;
+  if (iters.length) {
+    first = load(iters[0]);
+    inTotal = iters.reduce((a, it) => a + load(it), 0);
+    outTotal = iters.reduce((a, it) => a + n(it.output_tokens), 0);
+  } else {
+    inTotal = load(usage);
+    outTotal = n(usage.output_tokens);
+    if (turns === 1) first = inTotal;
+  }
+  if (inTotal === 0 && outTotal === 0) return null;
+  const out = { tokens_per_invocation: Math.round((inTotal + outTotal) / turns), input_tokens_total: inTotal, output_tokens_total: outTotal, invocations: turns };
+  if (first) out.first_turn_context_tokens = first;
+  return out;
+}
+/** One bounded, never-throwing POST of the measured usage → { status, ok } or null. */
+async function postUsage(handle, token, usage) {
+  const ac = new AbortController();
+  let timer;
+  const limit = new Promise((resolve) => { timer = setTimeout(() => { ac.abort(); resolve(null); }, PULL_REPORT_TIMEOUT_MS); });
+  const call = (async () => {
+    try {
+      const res = await fetch(USAGE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': `verigent-cli/${PKG_VERSION} pull-run` }, body: JSON.stringify({ handle, pull_token: token, usage }), signal: ac.signal });
+      return { status: res.status, ok: res.ok };
+    } catch { return null; }
+  })();
+  try { return await Promise.race([call, limit]); } finally { clearTimeout(timer); }
+}
 async function cmdPullRun() {
   const handle = positional[0];
   const cwd = flags.cwd || process.cwd();
@@ -516,9 +586,28 @@ async function cmdPullRun() {
       }
     } else log(`setup-material ${r ? `answered HTTP ${r.status}` : 'unreachable'} — no run report; the check runs anyway.`);
   }
-  const res = spawnSync(passthrough[0], passthrough.slice(1), { cwd, stdio: 'inherit' });
+  // A JSON-output claude run (the job `schedule` installs, 0.10.11+): capture stdout to read the measured usage,
+  // and still write the agent's result to the job log. Anything else passes through exactly as before.
+  const jsonRun = wantsJsonResult(passthrough);
+  const res = spawnSync(passthrough[0], passthrough.slice(1), jsonRun
+    ? { cwd, stdio: ['inherit', 'pipe', 'inherit'], encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 }
+    : { cwd, stdio: 'inherit' });
   const code = typeof res.status === 'number' ? res.status : 1;
   if (res.error) log(`could not start ${passthrough[0]}: ${res.error.message}`);
+  if (jsonRun) {
+    const raw = typeof res.stdout === 'string' ? res.stdout : '';
+    const parsed = parseClaudeResult(raw);
+    // The log keeps what the agent said: its result text when the JSON parses, else the raw output untouched.
+    if (parsed && typeof parsed.result === 'string') process.stdout.write(parsed.result.endsWith('\n') ? parsed.result : parsed.result + '\n');
+    else if (raw) process.stdout.write(raw);
+    const usage = parsed ? usageFromClaudeResult(parsed) : null;
+    if (usage && token) {
+      const u = await postUsage(handle, token, usage);
+      log(u && u.ok
+        ? `startup context measured — ${usage.first_turn_context_tokens != null ? usage.first_turn_context_tokens + ' tokens before the first reply' : 'no first-turn figure this run'}; reported.`
+        : 'startup context measured — the report did not go through (the check is unaffected).');
+    }
+  }
   if (started) {
     const e = await pullReport(handle, token, { next_check_at: nextCheckAt(cwd, handle), run_ended: true, run_id: runId, checking: [] });
     log(e && e.ok ? 'run finished — reported.' : 'run finished — the end report did not go through (the page stops showing "Checking" by itself).');
@@ -527,8 +616,9 @@ async function cmdPullRun() {
 }
 
 // ── schedule ─────────────────────────────────────────────────────────────────
-// Installs a credential-free wake-up job: 5x/day, runs `claude -p <cycle prompt>` in the agent's
-// directory. The pull token stays in the MCP server config (agents.txt §5f) — never here.
+// Installs a credential-free wake-up job: 5x/day, runs `claude -p <cycle prompt> --allowedTools <…>
+// --output-format json` (the JSON result carries the run's measured usage — pull-run reads it, 0.10.11) in the
+// agent's directory. The pull token stays in the MCP server config (agents.txt §5f) — never here.
 function cmdSchedule() {
   const handle = positional[0];
   if (!handle) { console.error('Usage: npx verigent schedule <handle> [--cwd <agent dir>] [--uninstall]'); process.exit(1); }
@@ -593,6 +683,8 @@ function cmdSchedule() {
     <string>${esc(CYCLE_PROMPT)}</string>
     <string>--allowedTools</string>
     <string>${esc(allowed)}</string>
+    <string>--output-format</string>
+    <string>json</string>
   </array>
   <key>WorkingDirectory</key><string>${esc(cwd)}</string>${extraEnv.length ? `
   <key>EnvironmentVariables</key>
@@ -627,7 +719,7 @@ First pull fires NOW (watch your agent's page — the dots move within minutes).
     // runs), and a double-quoted cwd / path would let cron's /bin/sh expand $ and backticks inside it.
     const npxBin = dryRun ? '/usr/local/bin/npx' : (which('npx') || '/usr/local/bin/npx');
     const wrap = flags.uninstall ? '' : pullRunPrefix(npxBin, handle, cwd).map((a) => cronQ(a, 'the working directory or npx path')).join(' ');
-    const line = flags.uninstall ? '' : `13 1,6,11,16,21 * * * cd ${cronQ(cwd, 'the working directory')} && ${envPrefix}${wrap} ${cronQ(claudeBin, 'the claude path')} -p ${cronQ(CYCLE_PROMPT, 'the cycle prompt')} --allowedTools ${cronQ(allowed, 'the allowed-tools list')} >> .verigent-pull.log 2>&1 ${tag}`;
+    const line = flags.uninstall ? '' : `13 1,6,11,16,21 * * * cd ${cronQ(cwd, 'the working directory')} && ${envPrefix}${wrap} ${cronQ(claudeBin, 'the claude path')} -p ${cronQ(CYCLE_PROMPT, 'the cycle prompt')} --allowedTools ${cronQ(allowed, 'the allowed-tools list')} --output-format json >> .verigent-pull.log 2>&1 ${tag}`;
     const current = (() => { try { return execSync('crontab -l', { encoding: 'utf8' }); } catch { return ''; } })();
     const cleaned = current.split('\n').filter((l) => !l.includes(tag)).join('\n').replace(/\n+$/, '');
     const next = flags.uninstall ? cleaned : `${cleaned}\n${line}`;

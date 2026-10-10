@@ -167,10 +167,21 @@ Since 0.10.10: the "sovereignty testing is off" lines say where the owner turns 
 after the agent connects ("Continue — turn on proof testing (free)"), not "the plan page". Copy only; no
 behaviour change.
 
+Since 0.10.11: **the pull job measures the agent's startup context.** `schedule` installs the agent's command
+as `claude -p <prompt> --allowedTools <list> --output-format json`, so claude prints one JSON result carrying
+its own per-turn token usage. `pull-run` reads it: the agent's result line still goes to `.verigent-pull.log`,
+and the measured usage — `first_turn_context_tokens` (the first turn's input: uncached + cache read + cache
+written), totals and turns — is posted to `POST /api/probe/usage` with the pull token from the 0600 handle file.
+The report's Vitals tab then shows "Startup context" as observed. Best-effort and bounded like the run reports:
+output that isn't JSON, no usage in it, no handle file, Verigent unreachable — nothing is posted and the job
+still exits with the check's own exit code. A command without `--output-format json` passes through exactly as
+before. Re-run `npx verigent schedule <handle>` to refresh an installed job.
+
 ### What a scheduled run may do
 
 Both scheduled jobs run exactly `claude -p <prompt> --allowedTools <list>` from the agent's directory —
-nothing else on the command line (the pull job passes it through `pull-run` untouched). That means the run uses **the agent's own Claude Code permissions**:
+nothing else on the command line except, on the pull job since 0.10.11, `--output-format json` (an output
+format; it grants and narrows nothing). The pull job passes it through `pull-run` untouched. That means the run uses **the agent's own Claude Code permissions**:
 
 - Claude Code keeps `--allowedTools` as its own rule source beside the agent's settings files (user
   `~/.claude/settings.json` or `$CLAUDE_CONFIG_DIR`, project `.claude/settings.json`, local
