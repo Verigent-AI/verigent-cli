@@ -64,8 +64,14 @@ const pendingCmd = (handle) => `npx -y verigent@${PKG_VERSION} prove pending --h
 // itself doesn't count, and a "no" is never worked around. Said in both scheduled prompts; `prove pending` prints
 // the exact one-message question at the step (askPaymentLine / askInboxLine). Pinned in tests/cli-prove +
 // tests/cli-continuous; mirrored in agents.txt §5f.
+// ENDPOINT (Ant 2026-10-12 06:51, cli 0.10.13): the same rule for the endpoint — installing cloudflared, or running a
+// persistent challenge handler and public tunnel on the owner's machine, is the agent's to do only on its owner's
+// yes (askEndpointLine, printed wherever the endpoint step tells the agent to install or run something). The
+// owner's own paste of `npx verigent continuous …` IS their consent for the handler that command starts, so that
+// path asks nothing.
 const ASK_OWNER_RULE =
-  "If you don't have your owner's standing permission for a payment or an inbox a step needs, ask your owner for it " +
+  "If you don't have your owner's standing permission for a payment, an inbox, or something to install or keep " +
+  'running on this machine (the endpoint\'s challenge handler and tunnel) that a step needs, ask your owner for it ' +
   'in one short message (the step prints the question) and act only once they say yes; a permission you write for ' +
   "yourself doesn't count, and if they say no, don't work around it.";
 const askPaymentLine = (amount, rail) =>
@@ -78,6 +84,10 @@ const askInboxLine = (where) =>
   `'Verigent's setup emails a one-time code to ${where} to prove I can read my output channel — may I read that ` +
   "inbox for Verigent's setup codes?' Only read it once they say yes; a permission you write for yourself doesn't " +
   "count, and if they say no, don't work around it.";
+const askEndpointLine = () =>
+  "If you don't have your owner's standing permission to set up the endpoint, ask them now, in one short message: " +
+  "'Verigent's setup needs a public web address that reaches me: a small challenge handler running on this machine behind a free Cloudflare tunnel (it needs cloudflared installed and stays running in the background). May I set that up?' Only install or start anything for it once they " +
+  "say yes; a permission you write for yourself doesn't count, and if they say no, don't work around it.";
 // What a scheduled run may do (#46, Ant 2026-10-07: "a capable agent should be able to pay and read its inbox
 // without the user doing anything"): the agent's OWN tools, as its own settings allow. Said in both prompts.
 const OWN_TOOLS =
@@ -1308,17 +1318,26 @@ const localProofsBusy = (cwd, handle) => {
 /** The endpoint, as a setup check does it: a running handler / cloudflared first (a quick tunnel's URL changes
  *  when its job restarts — the live one is read from the job log); else a saved URL from an earlier proof.
  *  → { acted, line } for the log. */
-async function endpointPending(ctx, m) {
+// agentRun (0.10.13, Chunk ruling 2026-10-12): `prove pending` — run by the agent inside a scheduled check — never
+// installs the handler job + tunnel by itself, even with cloudflared on PATH. It re-checks a handler that is already
+// running (and a saved URL); otherwise it prints askEndpointLine, and only on the owner's yes does the agent run the
+// explicit `prove endpoint` (which installs, as the owner-pasted `continuous` does). The setup-check loop (no agent;
+// started by the owner's own paste) calls this with agentRun false and installs exactly as before.
+async function endpointPending(ctx, m, { agentRun = false } = {}) {
   const known = savedEndpointUrl(ctx.cwd, ctx.handle);
   if (canInstallJobs() && (which('cloudflared') || await agentHandlerUp(ctx))) {
-    const a = await attemptEndpoint(ctx, { explicitPort: explicitPortFlag(), getSecret: async () => m.endpoint_secret });
-    return { acted: true, line: a.needs ? `endpoint: ${NEEDS_PUBLIC_URL}` : a.error ? `endpoint: ${a.error}` : `endpoint: ${saidLine(a.r)}` };
+    const a = await attemptEndpoint(ctx, { explicitPort: explicitPortFlag(), getSecret: async () => m.endpoint_secret, install: !agentRun });
+    if (!a.consent) return { acted: true, line: a.needs ? `endpoint: ${NEEDS_PUBLIC_URL}\n${askEndpointLine()}` : a.error ? `endpoint: ${a.error}` : `endpoint: ${saidLine(a.r)}` };
   }
   if (known) {
     const r = await postProof(ctx, { step: 'endpoint', url: known });
     return { acted: true, line: `endpoint: reported ${known}. ${saidLine(r)}` };
   }
-  return { acted: false, line: `endpoint: ${NEEDS_PUBLIC_URL}` };
+  if (agentRun && canInstallJobs() && which('cloudflared')) {
+    return { acted: false, line: `endpoint: ${ENDPOINT_NOT_SET_UP}\n${askEndpointLine()}\n${endpointOnYes(ctx.handle)}` };
+  }
+  // Ask your owner (0.10.13): the guidance tells the agent to install cloudflared — only on its owner's yes.
+  return { acted: false, line: `endpoint: ${NEEDS_PUBLIC_URL}\n${askEndpointLine()}` };
 }
 
 /** The loop's local work: the listed steps at the same time, under the local-proofs lock. */
@@ -1697,7 +1716,10 @@ async function attemptIdentity(ctx, m) {
 /** The endpoint: the handler as a persistent job (+ a cloudflared quick tunnel in the same job when there is
  *  no --public-url), then report the URL. → { needs } (no public URL possible — nothing installed, nothing
  *  fetched) · { error } (one sentence) · { url, r }. A proven URL is saved in the handle file. */
-async function attemptEndpoint(ctx, { explicitPort = null, publicUrl = '', getSecret }) {
+// install:false (0.10.13, Chunk ruling 2026-10-12) — `prove pending` inside an agent-driven run: never installs the
+// handler job / tunnel itself. An already-running handler with its tunnel is still re-checked and re-reported;
+// anything that would install returns { consent: true } so the caller prints askEndpointLine instead.
+async function attemptEndpoint(ctx, { explicitPort = null, publicUrl = '', getSecret, install = true }) {
   const dir = join(ctx.cwd, '.verigent');
   const secretPath = join(dir, `${ctx.handle}.hmac-secret`);
   const scriptPath = join(dir, `${ctx.handle}.handler.sh`);
@@ -1711,6 +1733,7 @@ async function attemptEndpoint(ctx, { explicitPort = null, publicUrl = '', getSe
   const needTunnel = !publicUrl && !url;
   const cloudflaredBin = needTunnel ? which('cloudflared') : null;
   if (needTunnel && !cloudflaredBin) return { needs: true, port };
+  if ((!up || needTunnel) && !install) return { consent: true, port };
   if (!up || needTunnel) {
     if (!existsSync(secretPath)) {
       const secret = await getSecret();
@@ -1753,6 +1776,9 @@ const canInstallJobs = () => process.platform === 'darwin' || process.platform =
 // What the agent needs when no public URL can be opened (the page's endpoint step says the same, in the
 // owner's words — setup-prompt.ts AGENT_NEEDS.endpoint).
 const NEEDS_PUBLIC_URL = 'No public URL: this agent needs one that reaches it — install cloudflared (brew install cloudflared, or https://github.com/cloudflare/cloudflared/releases) for a free quick tunnel, or give it a host it controls. The setup checks open the endpoint once one is there.';
+// 0.10.13: what `prove pending` says when cloudflared is here but the handler isn't running — it installs nothing.
+const ENDPOINT_NOT_SET_UP = "not set up yet — it needs this agent's challenge handler running in the background on this machine behind a free Cloudflare tunnel, and this check doesn't install that on its own.";
+const endpointOnYes = (handle) => `Only once your owner says yes, run \`npx -y verigent@${PKG_VERSION} prove endpoint --handle ${handle}\` — it installs the handler and the tunnel and reports the URL.`;
 const SETUP_CHECKS_NEXT = "Verigent's checks retry it automatically";
 const ENDPOINT_NEXT = "a public HTTPS URL on the agent's side; Verigent's checks pick it up";
 
@@ -1846,10 +1872,11 @@ async function cmdContinuous() {
     row('endpoint', s, s === 'proven' ? '—' : SETUP_CHECKS_NEXT);
   } else if (!canInstallJobs()) {
     console.log(NEEDS_PUBLIC_URL);
+    console.log(askEndpointLine()); // the install-cloudflared guidance is for later, on the agent's own — ask first
     row('endpoint', 'no public URL', ENDPOINT_NEXT);
   } else {
     const a = await attemptEndpoint(ctx, { explicitPort, getSecret: async () => m.endpoint_secret });
-    if (a.needs) { console.log(NEEDS_PUBLIC_URL); row('endpoint', 'no public URL', ENDPOINT_NEXT); }
+    if (a.needs) { console.log(NEEDS_PUBLIC_URL); console.log(askEndpointLine()); row('endpoint', 'no public URL', ENDPOINT_NEXT); }
     else if (a.error) { console.log(a.error); row('endpoint', 'not reported', SETUP_CHECKS_NEXT); }
     else {
       console.log(saidLine(a.r));
@@ -1948,7 +1975,7 @@ async function provePending(ctx) {
       console.log(a.error ? `signing key: ${a.error}` : `signing key: ${a.how} ${saidLine(a.r)}`);
     }
     if (!localBusy && s.endpoint === 'pending') {
-      const e = await endpointPending(ctx, m);
+      const e = await endpointPending(ctx, m, { agentRun: true }); // never installs on its own (0.10.13)
       if (e.acted) acted = true;
       console.log(e.line);
     }
@@ -2383,6 +2410,7 @@ async function proveEndpoint(ctx) {
   if (a.needs) {
     // ONE sentence, nothing installed (#28).
     console.error(`Needs a public URL: install cloudflared (brew install cloudflared, or https://github.com/cloudflare/cloudflared/releases) and re-run \`${PROVE_ENDPOINT_CMD}\` to open a quick tunnel, or re-run it with --public-url <url> if a tunnel or host already reaches port ${a.port} on this machine (this agent's handler port).`);
+    console.error(askEndpointLine());
     process.exit(1);
   }
   if (a.error) { console.error(a.error); process.exit(1); }

@@ -193,7 +193,16 @@ mode.** Two fixes from setting up a second agent on the same Mac:
 - *Ask your owner.* When a step needs a payment or an inbox the agent doesn't have its owner's standing
   permission for, `prove pending` (and both scheduled prompts) tell the agent to ask its owner in one short
   message — the exact question is printed at the step — and to act only once they say yes. A permission the
-  agent writes for itself doesn't count, and a "no" is never worked around.
+  agent writes for itself doesn't count, and a "no" is never worked around. Since 0.10.13 the endpoint is
+  covered too: wherever the endpoint step tells the agent to install or run something (install cloudflared,
+  run the challenge handler and a public tunnel on its owner's machine — `prove pending`, `prove endpoint`'s
+  "Needs a public URL", the no-cloudflared guidance in `continuous`), it prints the one-message question
+  ("Verigent's setup needs a public web address that reaches me: … May I set that up?"). The owner's own paste
+  of `npx verigent continuous …` is their consent for the handler that command starts — no question there.
+  `prove pending` (the agent's scheduled check) never installs the handler job or the tunnel itself, even with
+  cloudflared on PATH: it re-checks a handler that is already running (and a saved URL); otherwise it prints the
+  question and, for the yes, the explicit `npx verigent prove endpoint --handle <h>` — which installs, as `continuous`
+  and the setup-check loop started by the owner's paste do.
 
 ### What a scheduled run may do
 
