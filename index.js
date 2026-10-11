@@ -28,8 +28,9 @@
 // token via MCP env, and the handler job reads its secret from a 0600 file named by VG_SECRET_FILE.
 
 import { spawnSync, spawn, execSync } from 'node:child_process';
-import { createHmac, timingSafeEqual, generateKeyPairSync, createPrivateKey, createPublicKey, sign, randomBytes } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual, generateKeyPairSync, createPrivateKey, createPublicKey, sign, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 import { get as httpsGet } from 'node:https';
 import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, chmodSync, readdirSync, openSync, closeSync, statSync, utimesSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -58,11 +59,30 @@ const SAFE_HANDLE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 // The command the AGENT runs inside its scheduled check (#39). `--handle` always (#43): the agent's .verigent dir
 // also holds Verigent's own state files, and a check must never depend on guessing which agent it is.
 const pendingCmd = (handle) => `npx -y verigent@${PKG_VERSION} prove pending --handle ${handle}`;
+// ASK YOUR OWNER (Ant 2026-10-12 06:24): an agent without its owner's permission for the payment or the inbox step
+// asks ITS OWNER for it, in plain words — the owner is never left to discover it. A permission the agent writes for
+// itself doesn't count, and a "no" is never worked around. Said in both scheduled prompts; `prove pending` prints
+// the exact one-message question at the step (askPaymentLine / askInboxLine). Pinned in tests/cli-prove +
+// tests/cli-continuous; mirrored in agents.txt §5f.
+const ASK_OWNER_RULE =
+  "If you don't have your owner's standing permission for a payment or an inbox a step needs, ask your owner for it " +
+  'in one short message (the step prints the question) and act only once they say yes; a permission you write for ' +
+  "yourself doesn't count, and if they say no, don't work around it.";
+const askPaymentLine = (amount, rail) =>
+  "If you don't have your owner's standing permission to make this payment, ask them now, in one short message: " +
+  `'Verigent's setup needs one payment of ${amount} from my ${rail} wallet to prove I can move money — may I make ` +
+  "Verigent setup payments within the cap you set on the setup page?' Only pay once they say yes; a permission you " +
+  "write for yourself doesn't count, and if they say no, don't work around it.";
+const askInboxLine = (where) =>
+  `If you don't have your owner's standing permission to read ${where}, ask them now, in one short message: ` +
+  `'Verigent's setup emails a one-time code to ${where} to prove I can read my output channel — may I read that ` +
+  "inbox for Verigent's setup codes?' Only read it once they say yes; a permission you write for yourself doesn't " +
+  "count, and if they say no, don't work around it.";
 // What a scheduled run may do (#46, Ant 2026-10-07: "a capable agent should be able to pay and read its inbox
 // without the user doing anything"): the agent's OWN tools, as its own settings allow. Said in both prompts.
 const OWN_TOOLS =
   'Use your own tools for that, exactly as your own settings already allow them (your wallet for a payment, ' +
-  'your inbox for a code). ';
+  'your inbox for a code). ' + ASK_OWNER_RULE + ' ';
 // #42 (Ant 2026-10-06 "we should be doing that from our side only"): what the agent tells its owner. The owner
 // never runs a Verigent command. Dry run 2026-10-08 (#63 follow-up): the setup checks finish payment + channel
 // from the page's defaults / the agent's own inbox, so the owner acts only if the setup page asks.
@@ -90,16 +110,29 @@ const setupPrompt = (handle) =>
   'within the rail and cap your owner set on the setup page, from a wallet you control; an output-channel ' +
   'code only from the inbox your owner named, or the inbox you read and declared as your own. ' + OWN_TOOLS + 'Report what you did in one line. ' + OWNER_REPORT + ' ' +
   'Stop and alert your operator if it asks for anything else.';
-// ── THE SCHEDULED RUNS' PERMISSIONS (#46, Ant 2026-10-07) ──────────────────────────────────────────────────
-// Every scheduled run is exactly `claude -p <prompt> --allowedTools <VERIGENT_ALLOWED[,--allow extras]>` — and
-// NOTHING else on the command line. Why that is "the agent's own permissions, plus Verigent's two":
+// ── THE SCHEDULED RUNS' PERMISSIONS (#46, Ant 2026-10-07; auto mode pinned to default 0.10.12, Ant 2026-10-12) ──
+// Every scheduled run is exactly `claude -p <prompt> [--permission-mode default] --allowedTools
+// <VERIGENT_ALLOWED[,--allow extras]>` (the pull job adds `--output-format json`, 0.10.11) — and NOTHING else on
+// the command line; `--permission-mode default` is there ONLY when the agent's own mode is `auto` (below). Why
+// that is "the agent's own permission rules, plus Verigent's two":
 //   • Claude Code keeps --allowedTools as its OWN rule source ("cliArg") beside the agent's settings sources
 //     (user ~/.claude/settings.json or $CLAUDE_CONFIG_DIR, project .claude/settings.json, local
 //     .claude/settings.local.json, managed policy). Allow rules from every source are merged; deny rules from
 //     any source still win. So passing it ADDS rules — it never replaces, narrows or overrides the agent's own.
-//   • The permission mode is the agent's own `permissions.defaultMode` because no --permission-mode is passed.
-//   • Nothing that narrows is ever passed: no --tools, --disallowedTools, --setting-sources, --settings,
-//     --strict-mcp-config, --mcp-config, --restricted, --permission-mode, --dangerously-skip-permissions.
+//   • The permission MODE is the agent's own — EXCEPT `auto`, which is pinned to `default` (0.10.12, Ant
+//     2026-10-12 06:16 — Chunk's setup on the same Mac as Kit; scoped to auto only by Chunk's ruling the same
+//     morning). An operator whose settings say `permissions.defaultMode: "auto"` had every scheduled run's
+//     `prove pending` blocked by Claude Code's auto-mode classifier ("downloads and runs outside code") even
+//     though it was in --allowedTools AND the operator allowed Bash(npx *) — so payment / channel proofs never
+//     ran. In `default` mode the allow / deny RULES decide (the agent's settings files + Verigent's two); there is
+//     no classifier in the way and, headless, anything no rule allows is simply refused (never prompted).
+//     Any other mode (default / manual, acceptEdits, bypassPermissions, plan, dontAsk, or none set) → no flag:
+//     exactly 0.10.11's behaviour. The mode is read from the settings the job's claude loads (agentPermissionMode)
+//     — at install for the pull job, at each run for the setup-check run — and the choice is logged.
+//     `default` is the name every Claude Code version accepts (newer versions also call it `manual`).
+//   • Nothing that narrows the RULES is ever passed: no --tools, --disallowedTools, --setting-sources,
+//     --settings, --strict-mcp-config, --mcp-config, --restricted; and nothing that bypasses them — never
+//     --dangerously-skip-permissions or `--permission-mode bypassPermissions`.
 //     tests/cli-continuous.test.mjs pins the exact argv of both jobs.
 //   • The run starts in the agent's directory (project + local settings resolve there) with CLAUDE_CONFIG_DIR
 //     carried over when set (#11), so it reads the same settings the agent's own sessions read.
@@ -110,6 +143,32 @@ const setupPrompt = (handle) =>
 // "yes" given in an interactive session is not a setting and does not carry over.
 // `--allow <tools>` stays as an optional, additive operator grant (never required); it can only add rules.
 const VERIGENT_ALLOWED = () => ['mcp__verigent', `Bash(npx -y verigent@${PKG_VERSION} prove pending:*)`];
+/** What `auto` is pinned to in a scheduled run (see above): the rules govern, not the auto-mode classifier. */
+const SCHEDULED_PERMISSION_MODE = ['--permission-mode', 'default'];
+const readJsonQuiet = (path) => { try { const j = JSON.parse(readFileSync(path, 'utf8')); return j && typeof j === 'object' ? j : null; } catch { return null; } };
+/** The agent's effective `permissions.defaultMode` as the job's claude would load it: user settings
+ *  ($CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json), then the agent dir's .claude/settings.json,
+ *  then .claude/settings.local.json — a later one that sets it wins (project / local override user).
+ *  → { mode: string|null, from: path|null }. */
+function agentPermissionMode(cwd, configDir = process.env.CLAUDE_CONFIG_DIR) {
+  const sources = [
+    join(configDir ? String(configDir) : join(homedir(), '.claude'), 'settings.json'),
+    join(cwd, '.claude', 'settings.json'),
+    join(cwd, '.claude', 'settings.local.json'),
+  ];
+  let out = { mode: null, from: null };
+  for (const f of sources) {
+    const m = readJsonQuiet(f)?.permissions?.defaultMode;
+    if (typeof m === 'string' && m) out = { mode: m, from: f };
+  }
+  return out;
+}
+/** The mode args a scheduled run gets — `--permission-mode default` ONLY for `auto`, else none — and one log line. */
+function scheduledModeArgs(cwd, configDir) {
+  const { mode, from } = agentPermissionMode(cwd, configDir);
+  if (mode === 'auto') return { args: [...SCHEDULED_PERMISSION_MODE], line: `permission mode: "auto" (${from}) → this run passes --permission-mode default, so your settings' allow/deny rules decide, not auto mode's classifier.` };
+  return { args: [], line: `permission mode: ${mode ? `"${mode}" (${from})` : 'none set'} → left as is (no --permission-mode passed).` };
+}
 /** The operator's optional --allow extras: trimmed, non-empty, no commas (the list is comma-joined). */
 const allowExtras = (list) => (Array.isArray(list) ? list : String(list || '').split(','))
   .map((x) => String(x).trim()).filter((x) => x && !x.includes(','));
@@ -205,7 +264,7 @@ Usage:
                                         tunnel when cloudflared is on PATH (that URL changes whenever
                                         the job restarts — re-run this to re-report it). A proven URL is
                                         saved in the handle file, so 'continuous' re-checks it
-                                        [--public-url <https url>] [--port 8787] [--cwd <agent dir>]
+                                        [--public-url <https url>] [--port <n>] [--cwd <agent dir>]
   npx verigent prove wallet --rail sol|lightning [--cap "<text>"] [--tx <signature>]
                                         prove the payment: first prints the exact payment to make
                                         (never pays); then --tx <signature> (Solana) or a second run
@@ -222,7 +281,7 @@ Usage:
                                         is carried over from your shell automatically when set
   npx verigent handler                  run the sovereignty challenge endpoint (also answers Verigent's
                                         signed "check now" by starting this agent's setup check)
-                                        [--port 8787]  secret from VG_SECRET env (or --secret)
+                                        [--port <n>] (default 8787)  secret from VG_SECRET env (or --secret)
 
 Your handle and vgp_ token are in your welcome email. Docs: ${SITE}/agents.txt
 `);
@@ -616,7 +675,7 @@ async function cmdPullRun() {
 }
 
 // ── schedule ─────────────────────────────────────────────────────────────────
-// Installs a credential-free wake-up job: 5x/day, runs `claude -p <cycle prompt> --allowedTools <…>
+// Installs a credential-free wake-up job: 5x/day, runs `claude -p <cycle prompt> [--permission-mode default, auto only] --allowedTools <…>
 // --output-format json` (the JSON result carries the run's measured usage — pull-run reads it, 0.10.11) in the
 // agent's directory. The pull token stays in the MCP server config (agents.txt §5f) — never here.
 function cmdSchedule() {
@@ -645,6 +704,12 @@ function cmdSchedule() {
   if (process.env.CLAUDE_CONFIG_DIR && !extraEnv.some(([k]) => k === 'CLAUDE_CONFIG_DIR')) {
     extraEnv.push(['CLAUDE_CONFIG_DIR', process.env.CLAUDE_CONFIG_DIR]);
   }
+  // 0.10.12: `--permission-mode default` only when the agent's own mode is `auto` — decided now, at install, from
+  // the settings the job's claude will load (THE SCHEDULED RUNS' PERMISSIONS). Re-run to re-decide.
+  const modeCfg = (extraEnv.find(([k]) => k === 'CLAUDE_CONFIG_DIR') || [])[1];
+  const mode = flags.uninstall ? { args: [], line: '' } : scheduledModeArgs(cwd, modeCfg);
+  if (mode.line) console.log(`Pull job ${mode.line}`);
+  const modeStr = mode.args.length ? ` ${mode.args.join(' ')}` : '';
 
   if (process.platform === 'darwin') {
     const dir = join(homedir(), 'Library', 'LaunchAgents');
@@ -680,7 +745,8 @@ function cmdSchedule() {
     <string>${esc(a)}</string>`).join('')}
     <string>${esc(claudeBin)}</string>
     <string>-p</string>
-    <string>${esc(CYCLE_PROMPT)}</string>
+    <string>${esc(CYCLE_PROMPT)}</string>${mode.args.map((a) => `
+    <string>${a}</string>`).join('')}
     <string>--allowedTools</string>
     <string>${esc(allowed)}</string>
     <string>--output-format</string>
@@ -719,7 +785,7 @@ First pull fires NOW (watch your agent's page — the dots move within minutes).
     // runs), and a double-quoted cwd / path would let cron's /bin/sh expand $ and backticks inside it.
     const npxBin = dryRun ? '/usr/local/bin/npx' : (which('npx') || '/usr/local/bin/npx');
     const wrap = flags.uninstall ? '' : pullRunPrefix(npxBin, handle, cwd).map((a) => cronQ(a, 'the working directory or npx path')).join(' ');
-    const line = flags.uninstall ? '' : `13 1,6,11,16,21 * * * cd ${cronQ(cwd, 'the working directory')} && ${envPrefix}${wrap} ${cronQ(claudeBin, 'the claude path')} -p ${cronQ(CYCLE_PROMPT, 'the cycle prompt')} --allowedTools ${cronQ(allowed, 'the allowed-tools list')} --output-format json >> .verigent-pull.log 2>&1 ${tag}`;
+    const line = flags.uninstall ? '' : `13 1,6,11,16,21 * * * cd ${cronQ(cwd, 'the working directory')} && ${envPrefix}${wrap} ${cronQ(claudeBin, 'the claude path')} -p ${cronQ(CYCLE_PROMPT, 'the cycle prompt')}${modeStr} --allowedTools ${cronQ(allowed, 'the allowed-tools list')} --output-format json >> .verigent-pull.log 2>&1 ${tag}`;
     const current = (() => { try { return execSync('crontab -l', { encoding: 'utf8' }); } catch { return ''; } })();
     const cleaned = current.split('\n').filter((l) => !l.includes(tag)).join('\n').replace(/\n+$/, '');
     const next = flags.uninstall ? cleaned : `${cleaned}\n${line}`;
@@ -732,7 +798,7 @@ First pull fires NOW (watch your agent's page — the dots move within minutes).
     if (flags.uninstall) { if (!dryRun) removeSetupCheckJob(handle, cwd, { quiet: true }); return; }
     if (wantSetupCheck(handle, cwd)) installSetupCheck({ handle, cwd, claudeBin, allowed, extraEnv, npxBin: dryRun ? '/usr/local/bin/npx' : (which('npx') || '/usr/local/bin/npx') });
   } else {
-    console.log(`Automatic install isn't supported on ${process.platform} yet. Schedule this 5x/day yourself:\n\n  claude -p ${shq(CYCLE_PROMPT)} --allowedTools ${shq(allowed)}\n\n(run it from ${cwd} — where the MCP server is registered)`);
+    console.log(`Automatic install isn't supported on ${process.platform} yet. Schedule this 5x/day yourself:\n\n  claude -p ${shq(CYCLE_PROMPT)}${modeStr} --allowedTools ${shq(allowed)}\n\n(run it from ${cwd} — where the MCP server is registered)`);
     return;
   }
   console.log(`
@@ -742,7 +808,7 @@ system prompt / policy layer) so a well-built agent doesn't refuse the scheduled
   "${grantLine(handle)}"
 
 Scheduled checks run with your agent's own Claude Code permissions — its settings files and its
-permission mode, unchanged. Verigent adds only: ${allowed}
+permission mode, unchanged${mode.args.length ? " (except auto mode, run as default so your rules decide rather than auto mode's classifier)" : ''}. Verigent adds only: ${allowed}
 A scheduled run has no one to answer a permission prompt: whatever your agent pays or reads its inbox
 with works there when its own settings already allow it. Verigent's checks finish setup automatically.
 
@@ -1147,7 +1213,9 @@ async function cmdSetupCheck() {
       log(`to do: ${plan.run.join(' · ')} — agent run ${cur.tries} of ${maxTries}${plan.connected ? ' (setup only)' : ''}.`);
       const prompt = plan.connected ? setupPrompt(handle) : cyclePrompt(handle);
       const extras = Array.isArray(st.allow_extra) ? st.allow_extra : legacyExtras(st.allowed);
-      live.runP = agentRun(st.claude_bin || 'claude', ['-p', prompt, '--allowedTools', scheduledAllowed(extras)], cwd).then((res) => {
+      const mode = scheduledModeArgs(cwd); // 0.10.12: decided per run, from the settings this run's claude loads
+      log(mode.line);
+      live.runP = agentRun(st.claude_bin || 'claude', ['-p', prompt, ...mode.args, '--allowedTools', scheduledAllowed(extras)], cwd).then((res) => {
         log(`run ended (exit ${res.status ?? res.signal ?? (res.error && res.error.code) ?? '?'}).`);
         live.runP = null; live.runSteps = [];
       });
@@ -1241,10 +1309,9 @@ const localProofsBusy = (cwd, handle) => {
  *  when its job restarts — the live one is read from the job log); else a saved URL from an earlier proof.
  *  → { acted, line } for the log. */
 async function endpointPending(ctx, m) {
-  const port = parseInt(flags.port || '8787', 10);
   const known = savedEndpointUrl(ctx.cwd, ctx.handle);
-  if (canInstallJobs() && (which('cloudflared') || await handlerUp(port))) {
-    const a = await attemptEndpoint(ctx, { port, getSecret: async () => m.endpoint_secret });
+  if (canInstallJobs() && (which('cloudflared') || await agentHandlerUp(ctx))) {
+    const a = await attemptEndpoint(ctx, { explicitPort: explicitPortFlag(), getSecret: async () => m.endpoint_secret });
     return { acted: true, line: a.needs ? `endpoint: ${NEEDS_PUBLIC_URL}` : a.error ? `endpoint: ${a.error}` : `endpoint: ${saidLine(a.r)}` };
   }
   if (known) {
@@ -1401,7 +1468,16 @@ function cmdHandler() {
       reply(res, 200, { proof, timestamp: new Date().toISOString() });
     });
   });
+  // 0.10.12: a port someone else holds is a LOUD failure — exit non-zero, logged — never a silent half-start that
+  // leaves this agent's tunnel forwarding to another agent's handler (THE HANDLER'S PORT).
+  server.on('error', (e) => {
+    if (e && e.code === 'EADDRINUSE') console.error(`[verigent handler] Port ${port} is already in use by another process — this handler${agent ? ` for ${agent.handle}` : ''} cannot answer challenges there, so it is stopping (exit 1). Re-run \`${PROVE_ENDPOINT_CMD}\` to give this agent its own port.`);
+    else console.error(`[verigent handler] could not listen on :${port}: ${e && e.message ? e.message : e}`);
+    process.exit(1);
+  });
   server.listen(port, () => {
+    // The job's script opens its tunnel only once this file exists — i.e. once THIS handler holds the port.
+    if (flags['ready-file']) { try { writeFileSync(String(flags['ready-file']), `${process.pid} ${port}\n`); } catch (e) { console.error(`[verigent handler] could not write the ready file: ${e && e.message}`); } }
     console.log(`Verigent challenge handler listening on :${port}
 Contract: POST {"challenge":"<32-hex>"} → {"proof":"<hmac-sha256 hex>","timestamp":"<ISO>"}
 ${agent ? `Check now: a signed request from Verigent starts ${jobLabel('setupcheck', agent.handle)} (nothing else).` : 'Check now: off (no handle known — pass --handle <h>).'}
@@ -1621,16 +1697,20 @@ async function attemptIdentity(ctx, m) {
 /** The endpoint: the handler as a persistent job (+ a cloudflared quick tunnel in the same job when there is
  *  no --public-url), then report the URL. → { needs } (no public URL possible — nothing installed, nothing
  *  fetched) · { error } (one sentence) · { url, r }. A proven URL is saved in the handle file. */
-async function attemptEndpoint(ctx, { port, publicUrl = '', getSecret }) {
+async function attemptEndpoint(ctx, { explicitPort = null, publicUrl = '', getSecret }) {
   const dir = join(ctx.cwd, '.verigent');
   const secretPath = join(dir, `${ctx.handle}.hmac-secret`);
   const scriptPath = join(dir, `${ctx.handle}.handler.sh`);
   const logPath = join(dir, `${ctx.handle}.handler.log`);
-  let up = await handlerUp(port);
+  // 0.10.12: this agent's own port, and "up" only when THIS agent's handler answers there (THE HANDLER'S PORT).
+  const at = await resolveHandlerPort(ctx, { explicit: explicitPort, secret: readSecretFile(secretPath) });
+  if (at.error) return { error: at.error };
+  const { port } = at;
+  let up = at.ours;
   let url = publicUrl || (up ? tunnelUrl(logPath) : null);
   const needTunnel = !publicUrl && !url;
   const cloudflaredBin = needTunnel ? which('cloudflared') : null;
-  if (needTunnel && !cloudflaredBin) return { needs: true };
+  if (needTunnel && !cloudflaredBin) return { needs: true, port };
   if (!up || needTunnel) {
     if (!existsSync(secretPath)) {
       const secret = await getSecret();
@@ -1640,16 +1720,20 @@ async function attemptEndpoint(ctx, { port, publicUrl = '', getSecret }) {
       chmodSync(secretPath, 0o600);
       console.log(`Endpoint secret: written to ${secretPath} (mode 0600).`);
     }
+    if (at.moved) console.log(`Port ${at.moved} is held by another process (not this agent's handler) — moving ${ctx.handle}'s handler to its own port, ${port}.`);
     installHandlerJob({ handle: ctx.handle, cwd: ctx.cwd, port, withTunnel: needTunnel, cloudflaredBin, secretPath, scriptPath, logPath });
-    up = await waitFor(() => handlerUp(port), WAIT_MS);
-    if (!up) return { error: `The handler didn't answer on :${port} within ${WAIT_MS / 1000} s — see ${logPath}.` };
+    if (existsSync(handleFilePath(ctx.cwd, ctx.handle))) writeHandleFile(ctx.cwd, ctx.handle, { handler_port: port });
+    const secret = readSecretFile(secretPath);
+    up = await waitFor(() => handlerIsOurs(port, secret), WAIT_MS);
+    if (!up) return { error: `This agent's handler didn't answer on :${port} within ${WAIT_MS / 1000} s — see ${logPath}.` };
     if (needTunnel) {
       url = await waitFor(() => tunnelUrl(logPath), WAIT_MS);
       if (!url) return { error: `cloudflared didn't report a trycloudflare.com URL within ${WAIT_MS / 1000} s — see ${logPath}.` };
       console.log(`Quick tunnel: ${url} (this URL changes whenever the job restarts — the scheduled checks re-report it).`);
     }
   } else {
-    console.log(`Handler already up on :${port}${publicUrl ? '' : ` behind ${url}`} — left running.`);
+    if (existsSync(handleFilePath(ctx.cwd, ctx.handle)) && readHandleFile(ctx.cwd, ctx.handle).handler_port !== port) writeHandleFile(ctx.cwd, ctx.handle, { handler_port: port });
+    console.log(`This agent's handler is already up on :${port}${publicUrl ? '' : ` behind ${url}`} — left running.`);
   }
   // #55: a quick tunnel answers 30–60 s after it prints its URL — wait (bounded) until it reaches the handler.
   if (!publicUrl) {
@@ -1676,7 +1760,7 @@ async function cmdContinuous() {
   const handle = positional.find((a) => !a.startsWith('vgp_'));
   const token = String(flags.token || positional.find((a) => a.startsWith('vgp_')) || '').trim();
   if (!handle || !token) {
-    console.error('Usage: npx verigent continuous <handle> --token <vgp_token> [--cwd <agent dir>] [--env KEY=VALUE ...] [--key <ed25519 pem>] [--public-url <https url>] [--port 8787] [--harness-version <v>] [--dry-run]\n\nBoth values are in the setup prompt on your owner\'s report page.');
+    console.error('Usage: npx verigent continuous <handle> --token <vgp_token> [--cwd <agent dir>] [--env KEY=VALUE ...] [--key <ed25519 pem>] [--public-url <https url>] [--port <n>] [--harness-version <v>] [--dry-run]\n\nBoth values are in the setup prompt on your owner\'s report page.');
     process.exit(1);
   }
   const cwd = flags.cwd || process.cwd();
@@ -1684,7 +1768,7 @@ async function cmdContinuous() {
   const keyPath = keyPathFor(cwd, handle);
   const secretPath = join(keyDir, `${handle}.hmac-secret`);
   const flagUrl = String(flags['public-url'] || '').trim();
-  const port = parseInt(flags.port || '8787', 10);
+  const explicitPort = explicitPortFlag();
   const auth = { handle, pull_token: token };
   const ctx = { handle, token, site: SITE, cwd, file: null };
   const rows = []; // [step, result, next]
@@ -1753,7 +1837,7 @@ async function cmdContinuous() {
     row('endpoint', 'already proven');
   } else if (dryRun) {
     if (knownUrl) console.log(`[dry-run] POST ${SETUP_PROOF_URL} ${JSON.stringify({ ...auth, step: 'endpoint', url: knownUrl })}`);
-    else console.log(`[dry-run] would start the challenge handler as a job on :${port}${which('cloudflared') ? ' behind a cloudflared quick tunnel' : ' (no cloudflared on PATH — it would report nothing)'} and report its public URL`);
+    else console.log(`[dry-run] would start the challenge handler as a job on ${explicitPort ? `:${explicitPort}` : "this agent's own port"}${which('cloudflared') ? ' behind a cloudflared quick tunnel' : ' (no cloudflared on PATH — it would report nothing)'} and report its public URL`);
     row('endpoint', 'dry-run');
   } else if (knownUrl) {
     const r = await postProof(ctx, { step: 'endpoint', url: knownUrl });
@@ -1764,7 +1848,7 @@ async function cmdContinuous() {
     console.log(NEEDS_PUBLIC_URL);
     row('endpoint', 'no public URL', ENDPOINT_NEXT);
   } else {
-    const a = await attemptEndpoint(ctx, { port, getSecret: async () => m.endpoint_secret });
+    const a = await attemptEndpoint(ctx, { explicitPort, getSecret: async () => m.endpoint_secret });
     if (a.needs) { console.log(NEEDS_PUBLIC_URL); row('endpoint', 'no public URL', ENDPOINT_NEXT); }
     else if (a.error) { console.log(a.error); row('endpoint', 'not reported', SETUP_CHECKS_NEXT); }
     else {
@@ -1893,6 +1977,7 @@ async function provePending(ctx) {
         console.log(SOL_INDEX_LAG);
         console.log('If you already made this payment, report its signature instead of paying again.');
         console.log(`${STANDING_PERMISSION} Only pay within that cap, from a wallet you control.`);
+        console.log(askPaymentLine(`${sol.min_lamports} lamports`, 'Solana'));
         console.log(declineLine(PENDING_CMD, 'payment'));
       }
     } else {
@@ -1907,6 +1992,7 @@ async function provePending(ctx) {
         console.log(`This run was the first report. Pay this invoice${r.data.expires_at ? ` (expires ${r.data.expires_at})` : ''}:`);
         console.log(`  ${invoice}`);
         console.log(`${STANDING_PERMISSION} Only pay within that cap, from a wallet you control.`);
+        console.log(askPaymentLine(`${Number(r.data.sats) || 0} sats`, 'Lightning'));
         console.log(`Then run \`${PENDING_CMD}\` again once paid.`);
         console.log(declineLine(PENDING_CMD, 'payment'));
       }
@@ -1917,6 +2003,7 @@ async function provePending(ctx) {
     acted = true;
     console.log(`output channel: a code went to ${ch.email}. Find Verigent's email with the code for this agent's output channel in that inbox, then run:`);
     console.log(`  ${PENDING_CMD} --code <code>`);
+    console.log(askInboxLine(`the inbox at ${ch.email}`));
     console.log(declineLine(PENDING_CMD, 'channel'));
   } else if (s.channel === 'pending' || (s.channel === 'declared' && ch.email)) {
     const email = isEmail(inp.channel) ? bareEmail(inp.channel) : (ch.email || '');
@@ -1928,6 +2015,7 @@ async function provePending(ctx) {
       console.log(`Then find Verigent's email with the code in that inbox (on this check or your next one) and run:`);
       console.log(`  ${PENDING_CMD} --code <code>`);
       console.log("Only to read the code Verigent sends there. If you don't read an inbox of your own, leave this — your owner can type one on the setup page.");
+      console.log(askInboxLine('your own inbox'));
     } else if (ch.send_block) {
       // Review M1: Verigent won't send another code yet (per-agent / per-address cap) — don't re-declare; say why.
       console.log(`output channel: no new code this check — ${String(ch.send_block.reason || sendBlockWhen(ch.send_block))}`);
@@ -1938,6 +2026,7 @@ async function provePending(ctx) {
       if (r.data.pending_code) {
         console.log(`A code is on its way to ${email}. Find it in that inbox, then run:`);
         console.log(`  ${PENDING_CMD} --code <code>`);
+        console.log(askInboxLine(`the inbox at ${email}`));
         console.log(declineLine(PENDING_CMD, 'channel'));
       }
     }
@@ -1969,7 +2058,7 @@ async function provePending(ctx) {
 //                    the code back.
 const PROVE_USAGE = `Usage:
   ${PROVE_KEY_CMD} [--key <ed25519 pem>] [--cwd <agent dir>]
-  ${PROVE_ENDPOINT_CMD} [--public-url <https url>] [--port 8787] [--cwd <agent dir>]
+  ${PROVE_ENDPOINT_CMD} [--public-url <https url>] [--port <n>] [--cwd <agent dir>]
   ${PROVE_WALLET_SOL_CMD} | ${PROVE_WALLET_LN_CMD}  [--cap "<text>"] [--tx <signature>]
   ${PROVE_CHANNEL_CMD} | --channel "<text>" | --code <code>
   npx verigent prove pending [--tx <signature> | --code <code> | --declined payment|channel --reason "<why>"]   (run by the agent inside its scheduled check)
@@ -2057,12 +2146,96 @@ async function proveKey(ctx) {
 }
 
 // ── prove endpoint ──
-const handlerUp = async (port) => {
+// ── THE HANDLER'S PORT (0.10.12, Ant 2026-10-12 06:16 — Chunk set up on the same Mac as Kit) ─────────────────
+// Every agent's handler used to run on :8787. Two agents on one machine: the second handler couldn't bind
+// (EADDRINUSE) but its tunnel still forwarded to localhost:8787, so the FIRST agent's handler answered with the
+// wrong HMAC secret ("Webhook responded but the proof is not the required HMAC of the fresh challenge"). And
+// "Handler already up on :8787" trusted ANY listener there. Now:
+//   • each agent has its OWN port: a deterministic per-handle start in HANDLER_PORT_BASE..+SPAN (clear of the
+//     macOS 49152+ and Linux 32768+ ephemeral ranges), stepping up to the first free one. It is written into the
+//     handler job's script and saved as `handler_port` in the handle file, and reused on every re-run.
+//   • "already up" means THIS agent's handler: a local POST of a fresh random challenge must come back as its HMAC
+//     under THIS agent's secret (handlers from every earlier version answer that too) — never "something listens".
+//   • upgrade: a saved port, or an earlier install's port read from its handler script (≤0.10.11: :8787), is KEPT
+//     while it is this agent's handler or free — an agent alone on :8787 stays on :8787 — and MOVED to the agent's
+//     own port only when something else holds it (the clash).
+//   • --port <n> still names the port; held by anything but this agent's handler → refused, nothing installed.
+//   • the handler exits non-zero on EADDRINUSE, and the job opens its tunnel only after THIS handler is listening
+//     (installHandlerJob) — a tunnel never forwards to someone else's handler.
+const HANDLER_PORT_BASE = 20000;
+const HANDLER_PORT_SPAN = 10000;
+const HANDLER_PORT_TRIES = 64;
+const handlerPortStart = (handle) =>
+  HANDLER_PORT_BASE + (parseInt(createHash('sha256').update(String(handle).toLowerCase()).digest('hex').slice(0, 8), 16) % HANDLER_PORT_SPAN);
+/** Can a listener bind this port right now — on loopback AND on the wildcard (what the handler binds)? */
+const canBind = (port, host) => new Promise((res) => {
+  const srv = createNetServer();
+  srv.once('error', (e) => res(!!(host && e && (e.code === 'EADDRNOTAVAIL' || e.code === 'EAFNOSUPPORT'))));
+  srv.listen(host ? { port, host, exclusive: true } : { port, exclusive: true }, () => srv.close(() => res(true)));
+});
+const portFree = async (port) => (await canBind(port, '127.0.0.1')) && (await canBind(port));
+/** Is the listener on :port THIS agent's handler? It must answer a fresh challenge with HMAC(this agent's secret). */
+async function handlerIsOurs(port, secret) {
+  if (!secret || !Number.isInteger(port)) return false;
+  const challenge = randomBytes(16).toString('hex');
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) });
-    return res.ok && /verigent handler up/.test(await res.text());
+    const res = await fetch(`http://127.0.0.1:${port}/`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ challenge }), signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return false;
+    const j = await res.json();
+    const want = Buffer.from(createHmac('sha256', secret).update(challenge).digest('hex'));
+    const got = Buffer.from(j && typeof j.proof === 'string' ? j.proof : '');
+    return got.length === want.length && timingSafeEqual(got, want);
   } catch { return false; }
-};
+}
+const validPort = (p) => Number.isInteger(p) && p >= 1 && p <= 65535;
+/** --port as a number, or null when not given; anything else is refused. */
+function explicitPortFlag() {
+  if (flags.port === undefined || flags.port === true) return null;
+  const p = Number(String(flags.port).trim());
+  if (!validPort(p)) { console.error('--port must be a number from 1 to 65535.'); process.exit(1); }
+  return p;
+}
+/** The port this agent's handler had before this run: the handle file's `handler_port`, else the port in its
+ *  handler script (installs from ≤0.10.11 recorded it only there). null = none. */
+function priorHandlerPort(ctx) {
+  const saved = Number(readHandleFile(ctx.cwd, ctx.handle).handler_port);
+  if (validPort(saved)) return saved;
+  try {
+    const m = readFileSync(join(ctx.cwd, '.verigent', `${ctx.handle}.handler.sh`), 'utf8').match(/ handler --port (\d+)/);
+    const p = m ? Number(m[1]) : NaN;
+    return validPort(p) ? p : null;
+  } catch { return null; }
+}
+const readSecretFile = (path) => { try { return readFileSync(path, 'utf8').trim(); } catch { return ''; } };
+/** Is THIS agent's handler up on its known port right now? */
+async function agentHandlerUp(ctx) {
+  const port = priorHandlerPort(ctx);
+  return !!port && handlerIsOurs(port, readSecretFile(join(ctx.cwd, '.verigent', `${ctx.handle}.hmac-secret`)));
+}
+/** Which port this agent's handler uses. → { port, ours } (ours: THIS agent's handler already answers there),
+ *  plus moved: <old port> when a clash moved it · or { error } (one sentence). Binds nothing, writes nothing. */
+async function resolveHandlerPort(ctx, { explicit = null, secret = '' } = {}) {
+  if (explicit !== null) {
+    if (await handlerIsOurs(explicit, secret)) return { port: explicit, ours: true };
+    if (await portFree(explicit)) return { port: explicit, ours: false };
+    return { error: `Port ${explicit} is already in use by another process (not this agent's handler) — nothing installed. Re-run without --port and the CLI picks a free port for this agent, or name a free one.` };
+  }
+  const prior = priorHandlerPort(ctx);
+  if (prior) {
+    if (await handlerIsOurs(prior, secret)) return { port: prior, ours: true };
+    if (await portFree(prior)) return { port: prior, ours: false };
+  }
+  const start = handlerPortStart(ctx.handle);
+  for (let i = 0; i < HANDLER_PORT_TRIES; i++) {
+    const p = HANDLER_PORT_BASE + ((start - HANDLER_PORT_BASE + i) % HANDLER_PORT_SPAN);
+    if (p === prior) continue;
+    if (await handlerIsOurs(p, secret)) return { port: p, ours: true };
+    if (await portFree(p)) return { port: p, ours: false, ...(prior ? { moved: prior } : {}) };
+  }
+  return { error: `No free port for this agent's handler from ${start} up (${HANDLER_PORT_TRIES} tried) — re-run with --port <a free port>.` };
+}
 const tunnelUrl = (logPath) => {
   if (!existsSync(logPath)) return null;
   const m = readFileSync(logPath, 'utf8').match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/g);
@@ -2121,17 +2294,34 @@ function installHandlerJob({ handle, cwd, port, withTunnel, cloudflaredBin, secr
   const dirs = [npxDir, cloudflaredBin ? cloudflaredBin.replace(/\/[^/]+$/, '') : null, '/usr/local/bin', '/opt/homebrew/bin', '/usr/bin', '/bin'].filter(Boolean);
   const pathEnv = [...new Set(dirs)].join(':');
   const handlerCmd = `npx -y verigent@${PKG_VERSION} handler --port ${port} --handle ${handle}`;
+  const readyPath = join(cwd, '.verigent', `${handle}.handler.ready`);
+  // 0.10.12 (THE HANDLER'S PORT): :${port} is THIS agent's own port. With a tunnel, the tunnel starts only after the
+  // handler has written its ready file (it is listening — it holds the port); a handler that cannot bind exits
+  // non-zero and the job stops without a tunnel; if either stops later, the other is stopped too.
   const script = `#!/bin/sh
 # Installed by \`${PROVE_ENDPOINT_CMD}\` for ${handle} (job ${label}).
-# Runs the Verigent challenge handler on :${port}${withTunnel ? ' behind a cloudflared quick tunnel' : ''}.
+# Runs the Verigent challenge handler on :${port} (this agent's own port)${withTunnel ? ' behind a cloudflared quick tunnel' : ''}.
 # No credentials in here: the handler reads its HMAC secret from the 0600 file VG_SECRET_FILE names.
 export PATH="${pathEnv}"
 export VG_SECRET_FILE="${secretPath}"
 cd "${cwd}" || exit 1
-${withTunnel ? `${handlerCmd} &
+${withTunnel ? `READY="${readyPath}"
+rm -f "$READY"
+${handlerCmd} --ready-file "$READY" &
 HANDLER=$!
-trap 'kill $HANDLER 2>/dev/null' EXIT INT TERM
-cloudflared tunnel --no-autoupdate --url http://localhost:${port}` : `exec ${handlerCmd}`}
+trap 'kill $HANDLER $TUNNEL 2>/dev/null' EXIT INT TERM
+# The tunnel opens only once THIS handler is listening on :${port} — never in front of another process there.
+i=0
+until [ -f "$READY" ]; do
+  if ! kill -0 $HANDLER 2>/dev/null; then echo "[verigent] the handler for ${handle} could not start on :${port} (see above) — no tunnel opened."; exit 1; fi
+  i=$((i+1)); if [ $i -ge 180 ]; then echo "[verigent] the handler for ${handle} did not start on :${port} within 180 s — no tunnel opened."; exit 1; fi
+  sleep 1
+done
+cloudflared tunnel --no-autoupdate --url http://localhost:${port} &
+TUNNEL=$!
+while kill -0 $HANDLER 2>/dev/null && kill -0 $TUNNEL 2>/dev/null; do sleep 2; done
+kill -0 $HANDLER 2>/dev/null || echo "[verigent] the handler for ${handle} stopped — its tunnel is closed with it."
+exit 1` : `exec ${handlerCmd}`}
 `;
   mkdirSync(join(cwd, '.verigent'), { recursive: true, mode: 0o700 });
   writeFileSync(scriptPath, script, { mode: 0o700 });
@@ -2186,14 +2376,13 @@ cloudflared tunnel --no-autoupdate --url http://localhost:${port}` : `exec ${han
 }
 
 async function proveEndpoint(ctx) {
-  const port = parseInt(flags.port || '8787', 10);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) { console.error('--port must be a number from 1 to 65535.'); process.exit(1); }
+  const explicitPort = explicitPortFlag();
   const publicUrl = String(flags['public-url'] || '').trim();
   if (publicUrl && !/^https:\/\//.test(publicUrl)) { console.error('--public-url must start with https://'); process.exit(1); }
-  const a = await attemptEndpoint(ctx, { port, publicUrl, getSecret: async () => (await fetchMaterial(ctx.site, ctx.handle, ctx.token)).endpoint_secret });
+  const a = await attemptEndpoint(ctx, { explicitPort, publicUrl, getSecret: async () => (await fetchMaterial(ctx.site, ctx.handle, ctx.token)).endpoint_secret });
   if (a.needs) {
     // ONE sentence, nothing installed (#28).
-    console.error(`Needs a public URL: install cloudflared (brew install cloudflared, or https://github.com/cloudflare/cloudflared/releases) and re-run \`${PROVE_ENDPOINT_CMD}\` to open a quick tunnel, or re-run it with --public-url <url> if a tunnel or host already reaches port ${port} on this machine.`);
+    console.error(`Needs a public URL: install cloudflared (brew install cloudflared, or https://github.com/cloudflare/cloudflared/releases) and re-run \`${PROVE_ENDPOINT_CMD}\` to open a quick tunnel, or re-run it with --public-url <url> if a tunnel or host already reaches port ${a.port} on this machine (this agent's handler port).`);
     process.exit(1);
   }
   if (a.error) { console.error(a.error); process.exit(1); }

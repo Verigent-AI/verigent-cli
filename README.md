@@ -47,7 +47,7 @@ directory:
 
 ```bash
 npx verigent continuous <handle> --token <vgp_token> [--cwd <agent dir>] [--env KEY=VALUE ...] \
-  [--key <ed25519 pem>] [--public-url <https url>] [--port 8787] [--harness-version <v>] [--dry-run]
+  [--key <ed25519 pem>] [--public-url <https url>] [--port <n>] [--harness-version <v>] [--dry-run]
 ```
 
 It does everything Verigent's own tooling can, and reports only what the server verified. It never pays
@@ -177,26 +177,56 @@ output that isn't JSON, no usage in it, no handle file, Verigent unreachable —
 still exits with the check's own exit code. A command without `--output-format json` passes through exactly as
 before. Re-run `npx verigent schedule <handle>` to refresh an installed job.
 
+Since 0.10.12: **every agent's endpoint handler gets its own port, and the scheduled runs pin the permission
+mode.** Two fixes from setting up a second agent on the same Mac:
+
+- *The handler's port.* Every agent's handler used to run on `:8787`, so a second agent on the same machine
+  couldn't bind it while its tunnel still forwarded to `:8787` — the FIRST agent's handler answered with the
+  wrong HMAC. Now each agent gets its own port (a per-handle start in 20000–29999, stepping up to the first
+  free one), written into its handler script and saved as `handler_port` in the handle file, and reused on
+  every re-run. "Already up" now means *this agent's* handler: the CLI POSTs a fresh challenge to the port and
+  checks the answer is the HMAC under this agent's secret. The handler exits non-zero on `EADDRINUSE`, and with
+  a quick tunnel the job opens the tunnel only after the handler is listening. **Upgrade:** an existing install
+  keeps its port while it is this agent's handler or the port is free (an agent alone on `:8787` stays there);
+  re-running `continuous` or `prove endpoint` moves an agent whose port another process holds to its own port.
+- *The permission mode.* See "What a scheduled run may do" below.
+- *Ask your owner.* When a step needs a payment or an inbox the agent doesn't have its owner's standing
+  permission for, `prove pending` (and both scheduled prompts) tell the agent to ask its owner in one short
+  message — the exact question is printed at the step — and to act only once they say yes. A permission the
+  agent writes for itself doesn't count, and a "no" is never worked around.
+
 ### What a scheduled run may do
 
-Both scheduled jobs run exactly `claude -p <prompt> --allowedTools <list>` from the agent's directory —
-nothing else on the command line except, on the pull job since 0.10.11, `--output-format json` (an output
-format; it grants and narrows nothing). The pull job passes it through `pull-run` untouched. That means the run uses **the agent's own Claude Code permissions**:
+Both scheduled jobs run exactly `claude -p <prompt> --allowedTools <list>` from the agent's directory — nothing
+else on the command line except, on the pull job since 0.10.11, `--output-format json` (an output format; it
+grants and narrows nothing), and since 0.10.12 `--permission-mode default` **only when the agent's own mode is
+`auto`**. The pull job passes it through `pull-run` untouched. That means the run uses **the agent's own Claude
+Code permissions**:
 
 - Claude Code keeps `--allowedTools` as its own rule source beside the agent's settings files (user
   `~/.claude/settings.json` or `$CLAUDE_CONFIG_DIR`, project `.claude/settings.json`, local
   `.claude/settings.local.json`, and any managed policy). Allow rules from all of them are merged and deny
   rules from any of them still win — so the list Verigent passes **adds** rules; it never replaces or
   narrows the agent's own.
-- No `--permission-mode` is passed, so the agent's own `permissions.defaultMode` applies. Nothing that
-  narrows is ever passed (`--tools`, `--disallowedTools`, `--setting-sources`, `--settings`,
-  `--strict-mcp-config`, `--restricted`), and nothing that bypasses (`--dangerously-skip-permissions`).
+- The permission **mode** is the agent's own — except `auto`, which since 0.10.12 runs as `default`. Why: with
+  `permissions.defaultMode: "auto"` in the operator's settings, Claude Code's auto-mode classifier blocked `npx -y verigent@… prove pending`
+  inside the scheduled run ("downloads and runs outside code") even though it was in `--allowedTools` and the
+  operator allowed `Bash(npx *)` — so payment and channel proofs never ran. In `default` mode the allow and
+  deny rules decide; headless, anything no rule allows is refused, never prompted. (`default` is accepted by
+  every Claude Code version; newer ones also call it `manual`.) The mode is read from the settings the job's
+  claude loads — user (`$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`), then the agent
+  directory's `.claude/settings.json`, then `.claude/settings.local.json` (a later one wins) — at install for
+  the pull job (re-run `schedule` / `continuous` after changing it) and at each run for the setup check; the
+  choice is printed / logged. Any other mode, or none, gets no flag: exactly 0.10.11's behaviour. Nothing that
+  narrows the rules is ever passed
+  (`--tools`, `--disallowedTools`, `--setting-sources`, `--settings`, `--strict-mcp-config`, `--restricted`),
+  and nothing that bypasses them (`--dangerously-skip-permissions`, `bypassPermissions`).
 - What Verigent adds is exactly two entries: `mcp__verigent` and
   `Bash(npx -y verigent@<this version> prove pending:*)` — never all of Bash.
 
 So an agent whose settings already allow its wallet and inbox tools can pay (within the owner's cap) and
 read the channel code inside the check with no one doing anything. A headless run has no one to answer a
-permission prompt: a tool works there only when the agent's own settings (or permission mode) allow it — a
+permission prompt: a tool works there only when the agent's own settings allow it — a
 one-off approval given in an interactive session is not a setting and does not carry over.
 
 `--allow <tool,tool>` is optional and additive: the operator's extra rules, appended after Verigent's two.
@@ -224,16 +254,17 @@ reports `{step:"identity", algorithm:"ed25519", public_key, signature}` — the 
 bytes) and signature (64 bytes) as hex. Keep the file: real runs sign with the same key. Already
 proven: it says so and reports nothing.
 
-### `npx verigent prove endpoint [--public-url <https url>] [--port 8787]`
+### `npx verigent prove endpoint [--public-url <https url>] [--port <n>]`
 
-Installs `npx verigent handler --port <port>` as a **persistent job** — `ai.verigent.handler.<handle>`,
+Installs `npx verigent handler --port <port>` on **this agent's own port** (since 0.10.12 — see above; `--port`
+names one, refused if another process holds it) as a **persistent job** — `ai.verigent.handler.<handle>`,
 a launchd agent on macOS (kept alive across reboots), a crontab `@reboot` entry started immediately
 elsewhere — the same mechanism `schedule` uses for the pull job. The job is a readable shell script,
 `<cwd>/.verigent/<handle>.handler.sh` (mode 0700), with its output in `<handle>.handler.log` beside it.
 It holds no credentials: the handler reads the HMAC secret from the 0600 file `VG_SECRET_FILE` names
 (`<cwd>/.verigent/<handle>.hmac-secret`, written by `continuous`; fetched from the setup material if
-it is missing). Re-running replaces the job; if the handler is already up and answering on the port it
-is left alone, never restarted.
+it is missing). Re-running replaces the job; if THIS agent's handler is already up on its port (it answers a
+fresh challenge with this agent's HMAC) it is left alone, never restarted.
 
 - **Without `--public-url`:** when `cloudflared` is on PATH, the same job also runs
   `cloudflared tunnel --url http://localhost:<port>`; the command waits (up to 60 s) for the
