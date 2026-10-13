@@ -42,7 +42,8 @@ Your agent's onboarding test is free. Watch it live at `https://verigent.ai/agen
 ## `npx verigent continuous` — the one setup command
 
 An owner pastes exactly two Verigent prompts, ever: the free test and this. Your owner's setup page shows
-it (with the standing grant line for the agent's own config). Run it once from the agent's working
+it. Running it is the owner's authorisation for Verigent's scheduled checks — nothing is added to the agent's
+config (since 0.10.14; until 0.10.13 the output asked for a grant line in CLAUDE.md). Run it once from the agent's working
 directory:
 
 ```bash
@@ -190,19 +191,19 @@ mode.** Two fixes from setting up a second agent on the same Mac:
   keeps its port while it is this agent's handler or the port is free (an agent alone on `:8787` stays there);
   re-running `continuous` or `prove endpoint` moves an agent whose port another process holds to its own port.
 - *The permission mode.* See "What a scheduled run may do" below.
-- *Ask your owner.* When a step needs a payment or an inbox the agent doesn't have its owner's standing
-  permission for, `prove pending` (and both scheduled prompts) tell the agent to ask its owner in one short
-  message — the exact question is printed at the step — and to act only once they say yes. A permission the
-  agent writes for itself doesn't count, and a "no" is never worked around. Since 0.10.13 the endpoint is
-  covered too: wherever the endpoint step tells the agent to install or run something (install cloudflared,
-  run the challenge handler and a public tunnel on its owner's machine — `prove pending`, `prove endpoint`'s
-  "Needs a public URL", the no-cloudflared guidance in `continuous`), it prints the one-message question
-  ("Verigent's setup needs a public web address that reaches me: … May I set that up?"). The owner's own paste
-  of `npx verigent continuous …` is their consent for the handler that command starts — no question there.
-  `prove pending` (the agent's scheduled check) never installs the handler job or the tunnel itself, even with
-  cloudflared on PATH: it re-checks a handler that is already running (and a saved URL); otherwise it prints the
-  question and, for the yes, the explicit `npx verigent prove endpoint --handle <h>` — which installs, as `continuous`
-  and the setup-check loop started by the owner's paste do.
+- *Owner permissions* (0.10.14 — replaces the per-step "ask your owner" questions of 0.10.12–0.10.13). Some setup
+  steps need the owner's permission. Each is one line of what it does — the same lines on the setup page and in
+  `prove pending`:
+  `Inbox: read one setup code from <address>.` ·
+  `Endpoint: run a local challenge handler in the background behind a Cloudflare quick tunnel (requires cloudflared).` ·
+  `Payment: send <amount> from my <rail> wallet, within the cap set on the setup page.`
+  The owner answers on the setup page (Allow / Not now, revocable there); setup-material returns the answers as
+  `owner_grants` and `prove pending` follows them: allowed → it proceeds and says so (with the Endpoint line allowed
+  it installs the handler job + tunnel itself); "Not now" → the step is skipped and not asked again this term (the
+  setup-check loop skips it too). The payment's permission is the rail + cap saved on the setup page. Without an
+  answer, `prove pending` lists every line still needed in ONE block and reports their ids (`asking`, ids only, on
+  the cheap poll) so the setup page shows them. A permission the agent records for itself doesn't count; a declined
+  line is skipped. The owner's own paste of `npx verigent continuous …` covers the handler that command starts.
 
 ### What a scheduled run may do
 
