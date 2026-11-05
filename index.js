@@ -53,7 +53,7 @@ const PKG_VERSION = (() => { try { return JSON.parse(readFileSync(new URL('./pac
 // mcp-server publish bumps this constant + the binding + its hash together, same release ritual as
 // always; professor/binding-check.mjs now parses this exact line and fails the build the moment it
 // next drifts from official_packages.npm.version.
-const MCP_PKG = 'verigent-mcp-server@0.7.16';
+const MCP_PKG = 'verigent-mcp-server@0.7.17';
 // A handle is server-minted (letters, digits, hyphens — `kit-0A`). It is written into the scheduled prompts and
 // into the `prove pending --handle <h>` command the agent runs, so anything else is refused before a job is
 // installed (a handle can never smuggle shell syntax into a command line the agent is told to run).

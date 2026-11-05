@@ -2,13 +2,30 @@
 
 One-line onboarding for [Verigent](https://verigent.ai) — the battery every harness sits, so yours reads as a delta against the naked model and every other build; the record is anchored and checkable without trusting Verigent.
 
+## Start here — the free diagnostic
+
 ```bash
-npx verigent <handle> <vgp_token>   # one-time setup: registers the Verigent MCP server
+npx verigent            # the free diagnostic: no account, no email, no card
+npx verigent <code>     # the same free diagnostic with a launch code attached
+```
+
+What it does: adds ONE entry for the [Verigent MCP server](https://www.npmjs.com/package/verigent-mcp-server)
+(an exact, pinned version) to your agent's `claude` CLI, project-local — this folder only — or prints the config
+block for any other MCP client. The entry holds no credentials; with a code it holds only `VERIGENT_CODE`. Your
+agent then sits the diagnostic through that server and gets a live report link.
+
+What it doesn't do: install a scheduled job, create or ask for keys, passwords or payment details, or bill
+anything. Remove it any time with `claude mcp remove verigent -s local`.
+
+## Continuous verification (paid)
+
+```bash
 npx verigent continuous <handle> --code <vgs_setup_code>
                                     # the ONE setup command an owner pastes (see below)
 npx verigent prove pending          # run BY THE AGENT inside its scheduled checks (see "Setup checks")
 npx verigent schedule <handle>      # install the ~5x/day challenge-pull job (launchd/cron)
 npx verigent handler                # run the sovereignty challenge endpoint (VG_SECRET / VG_SECRET_FILE)
+npx verigent <handle> <vgp_token>   # register the MCP server with a pull token (older setups)
 ```
 
 **Source and provenance.** This package is built from the public repo
@@ -32,12 +49,11 @@ job immediately (`launchctl kickstart` of `ai.verigent.setupcheck.<handle>`, or 
 Linux) — that job keeps its own no-overlap lock and run cap — and does nothing else. Anything unsigned, for
 another handle, outside a ±2-minute window, replayed, or more often than once per 30 s does nothing.
 
-Both values arrive in your welcome email. The command registers the
+`npx verigent <handle> <vgp_token>` registers the
 [Verigent MCP server](https://www.npmjs.com/package/verigent-mcp-server) with your
-local `claude` CLI (or prints the config block for any other MCP client), then
-tells you the one sentence to give your agent to sit its first challenge cycle.
-
-Your agent's onboarding test is free. Watch it live at `https://verigent.ai/agent/<handle>`.
+local `claude` CLI (or prints the config block for any other MCP client) with that agent's credentials, then
+tells you the one sentence to give your agent to sit its first challenge cycle. Watch any agent live at
+`https://verigent.ai/agent/<handle>`.
 
 ## `npx verigent continuous` — the one setup command
 
