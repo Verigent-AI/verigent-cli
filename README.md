@@ -4,7 +4,7 @@ One-line onboarding for [Verigent](https://verigent.ai) — the battery every ha
 
 ```bash
 npx verigent <handle> <vgp_token>   # one-time setup: registers the Verigent MCP server
-npx verigent continuous <handle> --token <vgp_token>
+npx verigent continuous <handle> --code <vgs_setup_code>
                                     # the ONE setup command an owner pastes (see below)
 npx verigent prove pending          # run BY THE AGENT inside its scheduled checks (see "Setup checks")
 npx verigent schedule <handle>      # install the ~5x/day challenge-pull job (launchd/cron)
@@ -47,15 +47,24 @@ config (since 0.10.14; until 0.10.13 the output asked for a grant line in CLAUDE
 directory:
 
 ```bash
-npx verigent continuous <handle> --token <vgp_token> [--cwd <agent dir>] [--env KEY=VALUE ...] \
+npx verigent continuous <handle> --code <vgs_setup_code> [--cwd <agent dir>] [--env KEY=VALUE ...] \
   [--key <ed25519 pem>] [--public-url <https url>] [--port <n>] [--harness-version <v>] [--dry-run]
 ```
+
+**The setup code (since 0.10.15).** The command carries a single-use setup code (`vgs_` + 40 hex characters),
+not the pull token, so the long-lived credential is never in shell history or the process list. The CLI
+exchanges the code once — `POST /api/agent/setup-exchange {handle, code}` over HTTPS — for the agent's pull
+token, then stores the token only where it always has: the MCP server entry and the handle file
+`<cwd>/.verigent/<handle>.json` (mode 0600). A code works once, for one agent, and expires 24 hours after it is
+issued; a used, expired or mistyped code is refused with one line, and the agent's report has a new command
+(Connect your agent). `--dry-run` does not use the code. `--token <vgp_token>` is still accepted in place of
+`--code` for commands and scripts that already hold the pull token.
 
 It does everything Verigent's own tooling can, and reports only what the server verified. It never pays
 and never declares a channel — those wait for the owner's answers on the setup page, which the agent's
 setup checks then act on. Re-run it any time; a step already proven is skipped.
 
-1. **Material.** `POST /api/agent/setup-material` with the handle and pull token (read-only). If the
+1. **Material.** After the code exchange, `POST /api/agent/setup-material` with the handle and pull token (read-only). If the
    owner's page has not issued the setup yet it says so and exits 1; nothing below runs.
 2. **Connect.** Exactly `npx verigent <handle> <vgp_token>`: the MCP server entry, the ~5x/day pull job
    and the **setup-check** job (below). `CLAUDE_CONFIG_DIR` is carried from your shell into the jobs

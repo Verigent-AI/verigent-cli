@@ -2,7 +2,9 @@
 // npx verigent — one-line onboarding and operations for Verigent.
 //
 //   npx verigent <handle> <vgp_token>    register the Verigent MCP server for your agent
-//   npx verigent continuous <handle> --token <vgp_token>
+//   npx verigent continuous <handle> --code <vgs_setup_code>
+//                                        (the single-use setup code is exchanged once for the pull token —
+//                                        cli 0.10.15; `--token <vgp_token>` is still accepted)
 //                                        connect + CHECK the other four proofs: lights only what is already
 //                                        there (an existing key, a known endpoint URL); never creates, pays
 //                                        or declares anything (the first setup command)
@@ -253,13 +255,17 @@ Usage:
                                         (--no-schedule to skip the scheduler)
                                         [--harness-version <v>]  declare your build version on every
                                         pull (or set VERIGENT_HARNESS_VERSION); keys the version delta
-  npx verigent continuous <handle> --token <vgp_token>
+  npx verigent continuous <handle> --code <vgs_setup_code>
                                         the first setup command for continuous verification: connects
                                         (MCP server + pull job) and CHECKS the other four proofs,
                                         reporting only what is already there — a signing key that
                                         exists, an endpoint URL that is known. Never generates a key,
                                         opens a tunnel, pays or declares a channel; the summary names
                                         the next step for each. Re-run any time; proven steps are skipped.
+                                        The setup code works once and expires; it is exchanged over
+                                        HTTPS for the pull token, which is kept only in the MCP server
+                                        config and the 0600 handle file. A new command (with a new code)
+                                        is on the agent's report: Connect your agent.
                                         [--cwd <agent dir>]  where the pull job runs and the key lives
                                         [--env KEY=VALUE ...]  extra env for the job
                                         [--key <ed25519 pem>]  an existing signing key to use
@@ -293,7 +299,7 @@ Usage:
                                         signed "check now" by starting this agent's setup check)
                                         [--port <n>] (default 8787)  secret from VG_SECRET env (or --secret)
 
-Your handle and vgp_ token are in your welcome email. Docs: ${SITE}/agents.txt
+A paid agent's setup command is on its report page (Connect your agent). Docs: ${SITE}/agents.txt
 `);
   process.exit(code);
 }
@@ -1803,12 +1809,45 @@ const ENDPOINT_NOT_SET_UP = "not set up: it needs this agent's challenge handler
 const SETUP_CHECKS_NEXT = "Verigent's checks retry it automatically";
 const ENDPOINT_NEXT = "a public HTTPS URL on the agent's side; Verigent's checks pick it up";
 
+// ── the single-use setup code (cli 0.10.15; F-setup-1, Ant 2026-11-05) ──
+// The owner's setup command carries `--code vgs_…`, not the pull token, so the long-lived credential never sits in
+// shell history or the process list. POST /api/agent/setup-exchange {handle, code} answers the pull token ONCE; the
+// token then goes only where it always went (the MCP server entry + the 0600 handle file). The refusal line is the
+// server's SETUP_CODE_REFUSED_REASON word for word (functions/lib/setup-code.ts; pinned by tests/setup-code.test.mjs).
+const SETUP_CODE_PREFIX = 'vgs_';
+const SETUP_CODE_RE = /^vgs_[0-9a-f]{40}$/;
+const SETUP_EXCHANGE_URL = `${SITE}/api/agent/setup-exchange`;
+const SETUP_CODE_REFUSED = "The setup code was not accepted. A setup code works once, for one agent, and expires 24 hours after it is issued. A new setup command is on the agent's report: Connect your agent.";
+async function exchangeSetupCode(handle, code) {
+  if (!SETUP_CODE_RE.test(code)) { console.error(SETUP_CODE_REFUSED); process.exit(1); }
+  let r;
+  try { r = await postJson(SETUP_EXCHANGE_URL, { handle, code }); }
+  catch (e) { console.error(`Couldn't reach ${SITE}: ${e.message}. Try again in a moment.`); process.exit(1); }
+  if (r.status === 401) { console.error(SETUP_CODE_REFUSED); process.exit(1); }
+  if (r.status === 429) { console.error(r.data.reason || 'Too many refused setup codes from this address in the last hour. Wait, then try again.'); process.exit(1); }
+  const t = r.ok && r.data.ok ? r.data.pull_token : null;
+  if (typeof t !== 'string' || !/^vgp_[A-Za-z0-9_-]+$/.test(t)) { console.error(`Couldn't exchange the setup code: ${r.data.reason || r.data.error || `HTTP ${r.status}`}. Try again in a moment.`); process.exit(1); }
+  return t;
+}
+
 async function cmdContinuous() {
-  const handle = positional.find((a) => !a.startsWith('vgp_'));
-  const token = String(flags.token || positional.find((a) => a.startsWith('vgp_')) || '').trim();
-  if (!handle || !token) {
-    console.error('Usage: npx verigent continuous <handle> --token <vgp_token> [--cwd <agent dir>] [--env KEY=VALUE ...] [--key <ed25519 pem>] [--public-url <https url>] [--port <n>] [--harness-version <v>] [--dry-run]\n\nBoth values are in the setup prompt on your owner\'s report page.');
+  const handle = positional.find((a) => !a.startsWith('vgp_') && !a.startsWith(SETUP_CODE_PREFIX));
+  // --code (cli 0.10.15, F-setup-1): the single-use setup code the owner's setup screen prints; exchanged once below.
+  // --token (or a positional vgp_…) is still accepted for commands and scripts that already hold the pull token.
+  const code = String(flags.code || positional.find((a) => a.startsWith(SETUP_CODE_PREFIX)) || '').trim();
+  let token = String(flags.token || positional.find((a) => a.startsWith('vgp_')) || '').trim();
+  if (!handle || (!token && !code)) {
+    console.error('Usage: npx verigent continuous <handle> --code <setup code> [--cwd <agent dir>] [--env KEY=VALUE ...] [--key <ed25519 pem>] [--public-url <https url>] [--port <n>] [--harness-version <v>] [--dry-run]\n\nThe command, with its code, is on the agent\'s report page: Connect your agent.');
     process.exit(1);
+  }
+  if (!token) {
+    if (dryRun) {
+      console.log(`[dry-run] POST ${SETUP_EXCHANGE_URL} {"handle":${JSON.stringify(handle)},"code":"${SETUP_CODE_PREFIX}…"} — the code is not used in a dry run`);
+      token = 'vgp_<from-the-setup-code>';
+    } else {
+      token = await exchangeSetupCode(handle, code);
+      console.log('Setup code exchanged for this agent\'s pull token (the code is now used).');
+    }
   }
   const cwd = flags.cwd || process.cwd();
   const keyDir = join(cwd, '.verigent');
@@ -2162,7 +2201,7 @@ function resolveProveContext() {
   if (!handle) {
     const handles = listHandleFiles(dir);
     if (handles.length === 0) {
-      console.error(`No handle file in ${dir}: run \`npx verigent continuous <handle> --token <vgp_token>\` first (it saves one), or pass --handle <handle> --token <vgp_token>.`);
+      console.error(`No handle file in ${dir}: run the setup command from the agent's report first (\`npx verigent continuous <handle> --code <setup code>\` — it saves one), or pass --handle <handle> --token <vgp_token>.`);
       process.exit(1);
     }
     if (handles.length > 1) {
